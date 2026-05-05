@@ -150,16 +150,16 @@ wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 tar -xzf sift.tar.gz
 
 # Set dataset path
-export SIFT1M_PATH=/path/to/sift
+export SIFT1M_BASE_PATH=/path/to/sift
 
 # Run benchmarks (release mode required)
 RUSTFLAGS="-C target-cpu=native" cargo test --release
 
 # Arena only
-SIFT1M_HNSW_BENCH_VARIANT=arena cargo bench -p index --bench hnsw_sift1m 2> arena.txt
+SIFT1M_HNSW_BENCH_VARIANT=arena SIFT1M_HNSW_MEM_LOG_BUILD_ITER=1 cargo bench -p index --bench hnsw_sift1m 2> arena.txt
 
 # Naive only  
-SIFT1M_HNSW_BENCH_VARIANT=naive cargo bench -p index --bench hnsw_sift1m 2> naive.txt
+SIFT1M_HNSW_BENCH_VARIANT=naive SIFT1M_HNSW_MEM_LOG_BUILD_ITER=1 cargo bench -p index --bench hnsw_sift1m 2> naive.txt
 
 # Generate memory comparison chart
 python3 scripts/plot_memory.py arena.txt naive.txt

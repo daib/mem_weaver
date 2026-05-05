@@ -1,6 +1,16 @@
-[package]
-name = "mem_weaver"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+    "crates/common",
+    "crates/index",
+    "crates/mem",
+    "crates/vector",
+]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
+memmap2 = "0.9"
+wide = "0.7"
+thiserror = "2"
+serde = { version = "1.0", features = ["derive"] }
+criterion = "0.5"
+tracing = "0.1"

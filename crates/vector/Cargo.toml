@@ -1,0 +1,23 @@
+[package]
+name = "vector"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+mem = { path = "../mem" }
+wide    = { workspace = true }
+thiserror = { workspace = true }
+serde   = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+memmap2 = { workspace = true }
+
+[[bench]]
+name = "distance"
+harness = false
+
+[[bench]]
+name = "sift1m"
+harness = false

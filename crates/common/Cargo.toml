@@ -1,0 +1,17 @@
+[package]
+name = "common"
+version = "0.1.0"
+edition = "2021"
+description = "Shared types for MemWeaver crates"
+publish = false
+
+[dependencies]
+memmap2 = { workspace = true }
+thiserror = { workspace = true }
+wide = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rand = "0.8"

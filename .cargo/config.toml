@@ -1,0 +1,4 @@
+[alias]
+format = "fmt"
+[build]
+rustflags = ["-C", "target-cpu=native"]

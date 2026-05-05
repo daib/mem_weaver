@@ -1,31 +1,22 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug executable 'mem_weaver'",
-            "type": "lldb",
+            "name": "Launch Chrome",
             "request": "launch",
-            "cargo": {
-                "args": [
-                    "run",
-                    "--bin=mem_weaver"
-                ]
-            },
-            "args": []
+            "type": "chrome",
+            "url": "http://localhost:8080",
+            "webRoot": "${workspaceFolder}"
         },
         {
-            "name": "Debug unit tests in executable 'mem_weaver'",
+            "name": "Debug unit tests (vector)",
             "type": "lldb",
             "request": "launch",
             "cargo": {
-                "args": [
-                    "test",
-                    "--bin=mem_weaver"
-                ]
-            }
+                "args": ["test", "--no-run", "--lib", "-p", "vector"]
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
         }
     ]
 }

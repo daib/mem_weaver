@@ -65,7 +65,7 @@ impl NaiveNodeStore {
 
 const MAX_LEVEL: usize = 32;
 const LEVELS: usize = MAX_LEVEL + 1;
-pub const INVALID_NODE_ID: NodeId = u32::MAX;
+pub const INVALID_NODE_ID: NodeId = NodeId(u32::MAX);
 
 // the layout of the node is:
 // - vector: f32[dim]
@@ -198,17 +198,17 @@ impl NodeBlock {
         // TODO: Make this configurable based on the arena size and the number of bits to ignore for alignment
         // At the moment: 2MB arena = 2^21. Ignore 3 last bits for alignment arrive at 18 bits for offset.
         // The remaining is for node_index
-        (self.block_index << 18 | ((offset >> 3) & ((1 << 18) - 1))) as NodeId
+        NodeId((self.block_index << 18 | ((offset >> 3) & ((1 << 18) - 1))) as u32)
     }
 
     #[inline]
     fn derive_block_index(node_id: NodeId) -> usize {
-        (node_id >> 18) as usize
+        (node_id.0 >> 18) as usize
     }
 
     #[inline]
     fn derive_node_offset(node_id: NodeId) -> usize {
-        ((node_id & ((1 << 18) - 1)) as usize) << 3
+        ((node_id.0 & ((1 << 18) - 1)) as usize) << 3
     }
 
     // return the index of the new node in the block
@@ -376,22 +376,22 @@ impl HnswNodeStore for NaiveNodeStore {
     }
 
     fn push_node(&mut self, vector: &[f32], max_level: usize) -> Option<NodeId> {
-        let id = self.nodes.len() as NodeId;
+        let id = NodeId(self.nodes.len() as u32);
         self.vector_store.store_new(id, vector);
         self.nodes.push(GraphNode::new(max_level));
         Some(id)
     }
 
     fn neighbors_at(&self, id: NodeId, level: usize) -> &[NodeId] {
-        self.nodes[id as usize].neighbors_at(level)
+        self.nodes[id.0 as usize].neighbors_at(level)
     }
 
     fn ensure_level(&mut self, id: NodeId, level: usize) {
-        self.nodes[id as usize].ensure_level(level);
+        self.nodes[id.0 as usize].ensure_level(level);
     }
 
     fn save_neighbors(&mut self, id: NodeId, neighbors: &[NodeId], level: usize) {
-        self.nodes[id as usize].neighbors[level].extend(neighbors);
+        self.nodes[id.0 as usize].neighbors[level].extend(neighbors);
     }
 
     // update the edge from the node to the neighbor at the given level
@@ -403,16 +403,16 @@ impl HnswNodeStore for NaiveNodeStore {
         distance_fn: fn(&[f32], &[f32]) -> f32,
     ) -> bool {
         let cap = if level == 0 { self.m_max0 } else { self.m };
-        if self.nodes[src_id as usize].neighbors[level].contains(&dst_id) {
+        if self.nodes[src_id.0 as usize].neighbors[level].contains(&dst_id) {
             return true;
         }
-        if self.nodes[src_id as usize].neighbors[level].len() < cap {
-            self.nodes[src_id as usize].neighbors[level].push(dst_id);
+        if self.nodes[src_id.0 as usize].neighbors[level].len() < cap {
+            self.nodes[src_id.0 as usize].neighbors[level].push(dst_id);
             return true;
         }
 
         let (farthest_neighbor_index, farthest_distance) = {
-            let neighbors = &self.nodes[src_id as usize].neighbors[level];
+            let neighbors = &self.nodes[src_id.0 as usize].neighbors[level];
             let mut idx = 0usize;
             let mut dist = f32::MIN;
             for i in 0..neighbors.len() {
@@ -431,11 +431,11 @@ impl HnswNodeStore for NaiveNodeStore {
         }
 
         let removed_neighbor =
-            self.nodes[src_id as usize].neighbors[level][farthest_neighbor_index];
+            self.nodes[src_id.0 as usize].neighbors[level][farthest_neighbor_index];
         if removed_neighbor != src_id {
-            self.nodes[removed_neighbor as usize].neighbors[level].retain(|&x| x != src_id);
+            self.nodes[removed_neighbor.0 as usize].neighbors[level].retain(|&x| x != src_id);
         }
-        self.nodes[src_id as usize].neighbors[level][farthest_neighbor_index] = dst_id;
+        self.nodes[src_id.0 as usize].neighbors[level][farthest_neighbor_index] = dst_id;
         true
     }
 
@@ -611,13 +611,13 @@ mod tests {
         assert_eq!(store.len(), 0);
 
         let a = store.push_node(&[1.0, 2.0, 3.0, 4.0], 1).expect("push");
-        assert_eq!(a, 0);
+        assert_eq!(a, NodeId(0));
         let b = store.push_node(&[5.0, 6.0, 7.0, 8.0], 0).expect("push");
-        assert_eq!(b, 1);
+        assert_eq!(b, NodeId(1));
         assert_eq!(store.len(), 2);
 
-        assert_eq!(store.vector_at(0), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(store.vector_at(1), &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(store.vector_at(NodeId(0)), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(store.vector_at(NodeId(1)), &[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(store.nodes[0].max_level(), 1);
         assert_eq!(store.nodes[1].max_level(), 0);
     }
@@ -627,12 +627,12 @@ mod tests {
     fn naive_save_neighbors_extends_level_lists() {
         let mut store = NaiveNodeStore::new(4, 8);
         let id = store.push_node(&[0.0; 4], 2).expect("push");
-        let n0 = vec![10_u32, 11];
-        let n1 = vec![20_u32];
+        let n0 = vec![NodeId(10), NodeId(11)];
+        let n1 = vec![NodeId(20)];
         store.save_neighbors(id, &n0, 0);
         store.save_neighbors(id, &n1, 1);
-        assert_eq!(store.neighbors_at(id, 0), &[10, 11]);
-        assert_eq!(store.neighbors_at(id, 1), &[20]);
+        assert_eq!(store.neighbors_at(id, 0), &[NodeId(10), NodeId(11)]);
+        assert_eq!(store.neighbors_at(id, 1), &[NodeId(20)]);
         assert!(store.neighbors_at(id, 2).is_empty());
     }
 
@@ -642,10 +642,10 @@ mod tests {
     fn naive_ensure_level_extends_neighbor_structure() {
         let mut store = NaiveNodeStore::new(4, 8);
         let id = store.push_node(&[0.0; 4], 0).expect("push");
-        assert_eq!(store.nodes[id as usize].neighbors.len(), 1);
+        assert_eq!(store.nodes[id.0 as usize].neighbors.len(), 1);
         store.ensure_level(id, 3);
-        assert_eq!(store.nodes[id as usize].neighbors.len(), 4);
-        assert_eq!(store.nodes[id as usize].max_level(), 3);
+        assert_eq!(store.nodes[id.0 as usize].neighbors.len(), 4);
+        assert_eq!(store.nodes[id.0 as usize].max_level(), 3);
     }
 
     /// Strips [`INVALID_NODE_ID`] sentinels from a fixed-width arena neighbor row for assertions.
@@ -781,34 +781,35 @@ mod tests {
             // save some edges
             for l in 0..max_level + 1 {
                 let num_neighbors = if l == 0 { M_MAX0 } else { M };
-                let neighbors = vec![(i * (max_level + 10) + l) as NodeId; num_neighbors];
+                let neighbors = vec![NodeId((i * (max_level + 10) + l) as u32); num_neighbors];
                 node_block.save_neighbors(node_id, &neighbors.as_slice(), l);
             }
 
             // validate the edges
             for l in 0..max_level + 1 {
                 let num_neighbors = if l == 0 { M_MAX0 } else { M };
-                let expected_neighbors = vec![(i * (max_level + 10) + l) as NodeId; num_neighbors];
+                let expected_neighbors =
+                    vec![NodeId((i * (max_level + 10) + l) as u32); num_neighbors];
                 let actual_neighbors = node_block.neighbors_at(node_id, l);
                 assert_eq!(actual_neighbors.len(), num_neighbors);
-                assert_eq!(actual_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id} at level {l} should be {expected_neighbors:?}");
+                assert_eq!(actual_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
 
                 // test neighbors_at_mut
                 let neighbors_at_mut = node_block.neighbors_at_mut(node_id, l);
                 assert_eq!(neighbors_at_mut.len(), num_neighbors);
-                assert_eq!(neighbors_at_mut, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id} at level {l} should be {expected_neighbors:?}");
+                assert_eq!(neighbors_at_mut, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
 
                 // test using unsafe api
                 let unsafe_neighbors =
                     unsafe { Node::edges_at_level(node_address as *mut u8, DIM, l, M, M_MAX0) };
                 assert_eq!(unsafe_neighbors.len(), num_neighbors);
-                assert_eq!(unsafe_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id} at level {l} should be {expected_neighbors:?}");
+                assert_eq!(unsafe_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
 
                 // test using unsafe api with mut
                 let unsafe_neighbors_mut =
                     unsafe { Node::edges_at_level_mut(node_address as *mut u8, DIM, l, M, M_MAX0) };
                 assert_eq!(unsafe_neighbors_mut.len(), num_neighbors);
-                assert_eq!(unsafe_neighbors_mut, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id} at level {l} should be {expected_neighbors:?}");
+                assert_eq!(unsafe_neighbors_mut, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
 
                 // test the unsafe edges api
                 let unsafe_edges =
@@ -825,7 +826,7 @@ mod tests {
                 assert_eq!(
                     edges,
                     expected_neighbors.as_slice(),
-                    "edges at i {i} node {node_id} at level {l} should be {expected_neighbors:?}"
+                    "edges at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}"
                 );
             }
         }
@@ -854,7 +855,7 @@ mod tests {
             // initialize the neighbors
             for l in 0..max_level + 1 {
                 let num_neighbors = if l == 0 { M_MAX0 } else { M };
-                let neighbors = vec![(i * (max_level + 10) + l) as NodeId; num_neighbors];
+                let neighbors = vec![NodeId((i * (max_level + 10) + l) as u32); num_neighbors];
                 store.save_neighbors(node_id, &neighbors.as_slice(), l);
             }
             i += 1;
@@ -875,16 +876,17 @@ mod tests {
             assert_eq!(
                 store.vector_at(node_id),
                 stored.as_slice(),
-                "vector at node {node_id} should be {stored:?}"
+                "vector at node {node_id:?} should be {stored:?}"
             );
 
             // validate the neighbors
             for l in 0..max_level + 1 {
                 let num_neighbors = if l == 0 { M_MAX0 } else { M };
-                let expected_neighbors = vec![(i * (max_level + 10) + l) as NodeId; num_neighbors];
+                let expected_neighbors =
+                    vec![NodeId((i * (max_level + 10) + l) as u32); num_neighbors];
                 let actual_neighbors = store.neighbors_at(node_id, l);
                 assert_eq!(actual_neighbors.len(), num_neighbors);
-                assert_eq!(actual_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id} at level {l} should be {expected_neighbors:?}");
+                assert_eq!(actual_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
             }
         }
     }

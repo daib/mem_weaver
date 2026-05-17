@@ -9,7 +9,7 @@
 //! - `SIFT1M_RECALL_N_QUERIES` — number of queries to evaluate (default `10`).
 //! - `SIFT1M_HNSW_EF` — search `ef` at level 0 (default `256`; raise if recall is low on large N).
 
-use common::benchmark::{sift_min_recall, try_load_sift_ctx};
+use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
 use common::top_k_quickselect;
 use index::{HnswArena, HnswIndex, HnswNaive, NodeId, DEFAULT_ALIGNMENT};
 use rand::rngs::StdRng;
@@ -90,6 +90,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 M_MAX0,
                 ef_construction,
                 top_k_quickselect,
+                StdRng::seed_from_u64(RNG_SEED),
             )),
             skip: false,
         },
@@ -102,6 +103,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 ef_construction,
                 n_base,
                 top_k_quickselect,
+                StdRng::seed_from_u64(RNG_SEED),
             )),
             skip: false,
         },
@@ -113,7 +115,6 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
         }
         let label = test_case.label;
         let mut index = test_case.index;
-        let mut rng = StdRng::seed_from_u64(RNG_SEED);
 
         // Ground truth uses corpus row indices as VectorId. Arena [`NodeId`]s are block-encoded,
         // not 0..n-1 — map each insert's returned id → corpus index for recall comparison.
@@ -122,7 +123,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
         let t_idx = Instant::now();
         let mut batch_start = Instant::now();
         for (i, v) in corpus.iter().enumerate() {
-            let nid = index.insert(v.as_slice(), &mut rng);
+            let nid = index.insert(v.as_slice());
             graph_id_to_corpus.insert(nid, i);
             if (i + 1) % 10_000 == 0 {
                 eprintln!(
@@ -154,7 +155,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
             n_base,
             "{label}: HNSW should index every base vector"
         );
-        let (min_recall, _, _) = sift_min_recall(label, &corpus, q_data, dim, n_q, ef, |q| {
+        let (stats, _, _) = sift_recall_stats(label, &corpus, q_data, dim, n_q, ef, |q| {
             index
                 .search(q, K, ef)
                 .iter()
@@ -165,8 +166,9 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 .collect()
         });
         assert!(
-            min_recall >= 0.75,
-            "{label}: minimum recall@{K} vs brute force expected >= 0.75, got {min_recall} (try SIFT1M_HNSW_EF=512 or lower SIFT1M_RECALL_N_BASE)"
+            stats.min >= 0.75,
+            "{label}: minimum recall@{K} vs brute force expected >= 0.75, got min={} mean={} p95={} (try SIFT1M_HNSW_EF=512 or lower SIFT1M_RECALL_N_BASE)",
+            stats.min, stats.mean, stats.p95
         );
     }
 }

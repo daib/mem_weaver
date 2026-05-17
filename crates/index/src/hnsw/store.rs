@@ -17,7 +17,7 @@ pub struct NaiveVectorStore(Vec<Vec<f32>>);
 
 impl HnswVectorStore for NaiveVectorStore {
     fn store_new(&mut self, id: NodeId, data: &[f32]) -> bool {
-        if id != self.0.len() as NodeId {
+        if id != NodeId(self.0.len() as u32) {
             return false;
         }
         self.0.push(data.to_vec());
@@ -25,6 +25,6 @@ impl HnswVectorStore for NaiveVectorStore {
     }
 
     fn vector_at(&self, id: NodeId) -> &[f32] {
-        &self.0[id as usize]
+        &self.0[id.0 as usize]
     }
 }

@@ -22,17 +22,17 @@ impl Vector {
         vector_index: usize,
         num_vectors_per_block: usize,
     ) -> InternalId {
-        (block_index * num_vectors_per_block + vector_index) as InternalId
+        InternalId((block_index * num_vectors_per_block + vector_index) as u32)
     }
 
     #[inline]
     pub fn derive_block_index(internal_id: InternalId, num_vectors_per_block: usize) -> usize {
-        internal_id as usize / num_vectors_per_block
+        internal_id.0 as usize / num_vectors_per_block
     }
 
     #[inline]
     pub fn derive_vector_index(internal_id: InternalId, num_vectors_per_block: usize) -> usize {
-        internal_id as usize % num_vectors_per_block
+        internal_id.0 as usize % num_vectors_per_block
     }
 }
 /// A flat, arena-backed collection of fixed-dimension vectors for a single

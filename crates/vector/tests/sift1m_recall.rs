@@ -1,4 +1,4 @@
-use common::benchmark::{sift_min_recall, try_load_sift_ctx};
+use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
 use common::distance::euclidean_distance_sq;
 use common::{
     import_fvecs, read_fvecs_vector_at, top_k_quickselect, VectorId, DEFAULT_ARENA_CAPACITY,
@@ -86,12 +86,12 @@ fn sift1m_recall_exhaustive_nn() {
     );
     assert_eq!(store.num_vectors(), n_base);
 
-    let (min_recall, _, _) =
-        sift_min_recall("exhaustive_nn", &corpus, q_data, dim, n_q, ef_log, |q| {
+    let (stats, _, _) =
+        sift_recall_stats("exhaustive_nn", &corpus, q_data, dim, n_q, ef_log, |q| {
             exhaustive_l2_topk(q, K, store.iter())
         });
     assert_eq!(
-        min_recall, 1.0,
+        stats.min, 1.0,
         "exhaustive top-k over VectorStore must match brute-force GT on corpus rows"
     );
 

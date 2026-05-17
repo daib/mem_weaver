@@ -19,6 +19,37 @@ pub struct QueryPhaseTimings {
     pub hnsw_search: Duration,
 }
 
+/// Distribution summary for per-query recall scores.
+///
+/// `p95` is the nearest-rank 95th percentile on the *ascending* sort, so it
+/// reports a high-end recall (95% of queries score at or below it). Use `min`
+/// for the worst case.
+#[derive(Debug, Clone, Copy)]
+pub struct RecallStats {
+    pub min: f32,
+    pub mean: f32,
+    pub p95: f32,
+}
+
+fn compute_recall_stats(recalls: &mut [f32]) -> RecallStats {
+    if recalls.is_empty() {
+        return RecallStats {
+            min: 0.0,
+            mean: 0.0,
+            p95: 0.0,
+        };
+    }
+    recalls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let min = recalls[0];
+    let mean = recalls.iter().sum::<f32>() / recalls.len() as f32;
+    // Nearest-rank 95th percentile.
+    let idx = (((recalls.len() as f32) * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(recalls.len() - 1);
+    let p95 = recalls[idx];
+    RecallStats { min, mean, p95 }
+}
+
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
@@ -148,7 +179,7 @@ pub fn try_load_sift_ctx(
     })
 }
 
-pub fn sift_min_recall(
+pub fn sift_recall_stats(
     label: &str,
     corpus: &[Vec<f32>],
     q_data: &[u8],
@@ -156,10 +187,10 @@ pub fn sift_min_recall(
     n_q: usize,
     ef: usize,
     mut search: impl FnMut(&[f32]) -> Vec<VectorId>,
-) -> (f32, Duration, QueryPhaseTimings) {
+) -> (RecallStats, Duration, QueryPhaseTimings) {
     let wall = Instant::now();
     let mut timings = QueryPhaseTimings::default();
-    let mut min_recall = 1.0f32;
+    let mut recalls: Vec<f32> = Vec::with_capacity(n_q);
     for qi in 0..n_q {
         let q = read_fvecs_vector_at(q_data, dim, qi).expect("query fvecs");
 
@@ -180,9 +211,10 @@ pub fn sift_min_recall(
 
         let r = recall_at_k(&retrieved, &gt).expect("valid recall@k");
         validate_recall_score(r).expect("in-range score");
-        min_recall = min_recall.min(r);
+        recalls.push(r);
         eprintln!("{label} query {qi}: recall@{K} = {r:.4} (ef={ef})");
     }
+    let stats = compute_recall_stats(&mut recalls);
     let query_wall = wall.elapsed();
     eprintln!(
         "{label}: query phase wall {:.3} ms total | brute-force gt {:.3} ms | HNSW search {:.3} ms | {} queries | {:.3} ms/query avg (wall)",
@@ -192,5 +224,9 @@ pub fn sift_min_recall(
         n_q,
         ms(query_wall) / n_q.max(1) as f64,
     );
-    (min_recall, query_wall, timings)
+    eprintln!(
+        "{label}: recall@{K} min={:.4} mean={:.4} p95={:.4} ({} queries)",
+        stats.min, stats.mean, stats.p95, n_q
+    );
+    (stats, query_wall, timings)
 }

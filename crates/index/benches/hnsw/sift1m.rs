@@ -255,10 +255,9 @@ fn execute_benchmark(c: &mut Criterion, ctx: &SiftCtx, index: &mut dyn HnswIndex
     );
 
     let mut insert_search_index = || {
-        let mut rng = StdRng::seed_from_u64(RNG_SEED);
         let insert_started = Instant::now();
         for (i, v) in corpus.iter().enumerate() {
-            index.insert(v.as_slice(), &mut rng);
+            index.insert(v.as_slice());
             log_rss_after_insert(i + 1, *n_base, *mem_insert_step, insert_started);
         }
         assert_eq!(index.len(), *n_base);
@@ -286,11 +285,11 @@ fn execute_benchmark(c: &mut Criterion, ctx: &SiftCtx, index: &mut dyn HnswIndex
                 *ef_construction,
                 *n_base,
                 top_k_quickselect,
+                StdRng::seed_from_u64(RNG_SEED),
             );
-            let mut rng = StdRng::seed_from_u64(RNG_SEED);
             let insert_started = Instant::now();
             for (i, v) in corpus.iter().enumerate() {
-                arena.insert(v.as_slice(), &mut rng);
+                arena.insert(v.as_slice());
                 if *log_mem_inside_build_bench {
                     log_rss_after_insert(i + 1, *n_base, *mem_insert_step, insert_started);
                 }
@@ -351,12 +350,18 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
         let t0 = Instant::now();
         let index: Box<dyn HnswIndex> = match flavor {
             SmokeFlavor::Arena => {
-                let mut arena =
-                    HnswArena::new(dim, M, M_MAX0, ef_construction, n_base, top_k_quickselect);
-                let mut rng = StdRng::seed_from_u64(RNG_SEED);
+                let mut arena = HnswArena::new(
+                    dim,
+                    M,
+                    M_MAX0,
+                    ef_construction,
+                    n_base,
+                    top_k_quickselect,
+                    StdRng::seed_from_u64(RNG_SEED),
+                );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    arena.insert(v.as_slice(), &mut rng);
+                    arena.insert(v.as_slice());
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -365,11 +370,17 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                 Box::new(arena)
             }
             SmokeFlavor::Naive => {
-                let mut naive = HnswNaive::new(dim, M, M_MAX0, ef_construction, top_k_quickselect);
-                let mut rng = StdRng::seed_from_u64(RNG_SEED);
+                let mut naive = HnswNaive::new(
+                    dim,
+                    M,
+                    M_MAX0,
+                    ef_construction,
+                    top_k_quickselect,
+                    StdRng::seed_from_u64(RNG_SEED),
+                );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    naive.insert(v.as_slice(), &mut rng);
+                    naive.insert(v.as_slice());
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -403,12 +414,18 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
         let t0 = Instant::now();
         match flavor {
             SmokeFlavor::Arena => {
-                let mut arena =
-                    HnswArena::new(dim, M, M_MAX0, ef_construction, n_base, top_k_quickselect);
-                let mut rng = StdRng::seed_from_u64(RNG_SEED);
+                let mut arena = HnswArena::new(
+                    dim,
+                    M,
+                    M_MAX0,
+                    ef_construction,
+                    n_base,
+                    top_k_quickselect,
+                    StdRng::seed_from_u64(RNG_SEED),
+                );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    arena.insert(v.as_slice(), &mut rng);
+                    arena.insert(v.as_slice());
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -416,11 +433,17 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                 black_box(arena.len());
             }
             SmokeFlavor::Naive => {
-                let mut naive = HnswNaive::new(dim, M, M_MAX0, ef_construction, top_k_quickselect);
-                let mut rng = StdRng::seed_from_u64(RNG_SEED);
+                let mut naive = HnswNaive::new(
+                    dim,
+                    M,
+                    M_MAX0,
+                    ef_construction,
+                    top_k_quickselect,
+                    StdRng::seed_from_u64(RNG_SEED),
+                );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    naive.insert(v.as_slice(), &mut rng);
+                    naive.insert(v.as_slice());
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -443,6 +466,7 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
             ef_construction,
             n_base,
             top_k_quickselect,
+            StdRng::seed_from_u64(RNG_SEED),
         )),
         SmokeFlavor::Naive => Box::new(HnswNaive::new(
             dim,
@@ -450,13 +474,13 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
             M_MAX0,
             ef_construction,
             top_k_quickselect,
+            StdRng::seed_from_u64(RNG_SEED),
         )),
     };
-    let mut rng = StdRng::seed_from_u64(RNG_SEED);
     let insert_started = Instant::now();
     let t_warmup_insert = Instant::now();
     for (i, v) in setup.corpus.iter().enumerate() {
-        index.insert(v.as_slice(), &mut rng);
+        index.insert(v.as_slice());
         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
     }
     assert_eq!(index.len(), n_base);
@@ -540,6 +564,7 @@ fn bench_hnsw_sift1m(c: &mut Criterion) {
         ef_construction,
         ctx.n_base,
         top_k_quickselect,
+        StdRng::seed_from_u64(RNG_SEED),
     );
     execute_benchmark(c, ctx, &mut arena);
 }
@@ -560,7 +585,14 @@ fn bench_hnsw_naive_sift1m(c: &mut Criterion) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_EF_CONSTRUCTION);
 
-    let mut naive = HnswNaive::new(ctx.dim, M, M_MAX0, ef_construction, top_k_quickselect);
+    let mut naive = HnswNaive::new(
+        ctx.dim,
+        M,
+        M_MAX0,
+        ef_construction,
+        top_k_quickselect,
+        StdRng::seed_from_u64(RNG_SEED),
+    );
     execute_benchmark(c, ctx, &mut naive);
 }
 

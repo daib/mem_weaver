@@ -1,4 +1,18 @@
 [alias]
 format = "fmt"
+sift1m-recall-hnsw = "test --release --test sift1m_hnsw_recall -- --nocapture"
+sift1m-recall-time-bucket = "test --release  --test sift1m_time_bucket_recall -- --nocapture"
+
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[env]
+# Fill in the absolute path to the directory containing sift_base.fvecs / sift_query.fvecs.
+# SIFT1M_BASE_PATH = "/absolute/path/to/sift"
+
+# Optional overrides — uncomment as needed:
+# SIFT1M_RECALL_N_BASE = "100000"
+# SIFT1M_RECALL_N_QUERIES = "100"
+# SIFT1M_HNSW_EF = "256"
+# SIFT1M_HNSW_EF_CONSTRUCTION = "400"
+# SIFT1M_TIME_BUCKET_COUNTS = "1,4,16,64"

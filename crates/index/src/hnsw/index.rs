@@ -5,15 +5,16 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fmt;
 
 use common::OrdF32;
+use rand::rngs::StdRng;
 use vector::distance::euclidean_distance_sq;
 
 use super::nodes::{ArenaNodeStore, HnswNodeStore, NaiveNodeStore, NodeId, INVALID_NODE_ID};
 
-/// Façade over [`Hnsw`] (`insert` / `search`). `insert` takes [`rand::RngCore`] as a trait object so
+/// Façade over [`Hnsw`] (`insert` / `search`).
 /// [`HnswNaive`] / [`HnswArena`] can be used as `dyn HnswIndex`.
 pub trait HnswIndex {
     fn len(&self) -> usize;
-    fn insert(&mut self, vector: &[f32], rng: &mut dyn rand::RngCore) -> NodeId;
+    fn insert(&mut self, vector: &[f32]) -> NodeId;
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)>;
 }
 
@@ -30,6 +31,7 @@ pub struct Hnsw<N: HnswNodeStore> {
     pub entry_point: Option<NodeId>,
     graph: N,
     closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
+    rng: StdRng,
 }
 
 impl<N: HnswNodeStore> fmt::Debug for Hnsw<N>
@@ -59,6 +61,7 @@ impl Hnsw<NaiveNodeStore> {
         m_max0: usize,
         ef_construction: usize,
         closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
+        rng: StdRng,
     ) -> Self {
         assert!(dim > 0, "dim must be positive");
         assert!(m >= 2, "m must be at least 2");
@@ -75,6 +78,7 @@ impl Hnsw<NaiveNodeStore> {
             entry_point: None,
             graph: NaiveNodeStore::new(m, m_max0),
             closest_m_candidates,
+            rng,
         }
     }
 }
@@ -84,9 +88,9 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
         Hnsw::len(self)
     }
 
-    fn insert(&mut self, vector: &[f32], rng: &mut dyn rand::RngCore) -> NodeId {
+    fn insert(&mut self, vector: &[f32]) -> NodeId {
         // Call inherent `Hnsw::insert`, not this trait method (same name would recurse).
-        Hnsw::insert(self, vector, rng)
+        Hnsw::insert(self, vector)
     }
 
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)> {
@@ -108,6 +112,7 @@ impl Hnsw<ArenaNodeStore> {
         ef_construction: usize,
         node_block_capacity: usize,
         closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
+        rng: StdRng,
     ) -> Self {
         assert!(dim > 0, "dim must be positive");
         assert!(m >= 2, "m must be at least 2");
@@ -131,6 +136,7 @@ impl Hnsw<ArenaNodeStore> {
             entry_point: None,
             graph,
             closest_m_candidates,
+            rng,
         }
     }
 }
@@ -162,9 +168,9 @@ impl<N: HnswNodeStore> Hnsw<N> {
         self.dim
     }
 
-    fn random_level(&self, rng: &mut dyn rand::RngCore) -> usize {
+    fn random_level(&mut self) -> usize {
         use rand::Rng;
-        let mut level = ((-rng.gen::<f64>().ln()) * self.ml).floor() as i32;
+        let mut level = ((-self.rng.gen::<f64>().ln()) * self.ml).floor() as i32;
         if level < 0 {
             level = 0;
         }
@@ -172,7 +178,7 @@ impl<N: HnswNodeStore> Hnsw<N> {
     }
 
     /// Insert a vector; returns internal id (`0 .. self.len()-1` after insert).
-    pub fn insert(&mut self, vector: &[f32], rng: &mut dyn rand::RngCore) -> NodeId {
+    pub fn insert(&mut self, vector: &[f32]) -> NodeId {
         assert_eq!(
             vector.len(),
             self.dim,
@@ -182,7 +188,7 @@ impl<N: HnswNodeStore> Hnsw<N> {
         );
 
         // select a random level for the new node
-        let level = self.random_level(rng);
+        let level = self.random_level();
         let q_buf = vector;
         let new_id = self
             .graph
@@ -357,28 +363,27 @@ mod tests {
 
     use super::super::{HnswArena, HnswNaive};
     use super::*;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
 
     #[test]
     fn hnsw_naive_recalls_bruteforce_small() {
         let dim = 8usize;
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut index: HnswNaive = HnswNaive::new(dim, 8, 16, 128, top_k_quickselect);
+        let rng = StdRng::seed_from_u64(42);
+        let mut index: HnswNaive = HnswNaive::new(dim, 8, 16, 128, top_k_quickselect, rng);
 
         let n = 200usize;
         for i in 0..n {
             let v: Vec<f32> = (0..dim)
                 .map(|j| ((i * dim + j) as f32 * 0.03).sin())
                 .collect();
-            index.insert(v.as_slice(), &mut rng);
+            index.insert(v.as_slice());
         }
 
         let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.1).cos()).collect();
 
         let mut brute: Vec<(NodeId, f32)> = (0..n)
             .map(|i| {
-                let id = i as NodeId;
+                let id = NodeId(i as u32);
                 (id, euclidean_distance_sq(&query, index.vector_at(id)))
             })
             .collect();
@@ -398,21 +403,21 @@ mod tests {
 
     #[test]
     fn hnsw_naive_first_insert_is_entry() {
-        let mut rng = StdRng::seed_from_u64(1);
-        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, top_k_quickselect);
-        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice(), &mut rng);
-        assert_eq!(id, 0);
-        assert_eq!(index.entry_point, Some(0));
+        let rng = StdRng::seed_from_u64(1);
+        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, rng);
+        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice());
+        assert_eq!(id, NodeId(0));
+        assert_eq!(index.entry_point, Some(NodeId(0)));
         let r = index.search(&[1.0, 0.0, 0.0, 0.0], 1, 8);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].0, 0);
+        assert_eq!(r[0].0, NodeId(0));
     }
 
     #[test]
     fn hnsw_arena_recalls_bruteforce_small() {
         let dim = 8usize;
-        let mut rng = StdRng::seed_from_u64(42);
-        let mut index: HnswArena = HnswArena::new(dim, 8, 16, 128, 1024, top_k_quickselect);
+        let rng = StdRng::seed_from_u64(42);
+        let mut index: HnswArena = HnswArena::new(dim, 8, 16, 128, 1024, top_k_quickselect, rng);
 
         let n = 200usize;
         let mut inserted: Vec<NodeId> = Vec::with_capacity(n);
@@ -420,7 +425,7 @@ mod tests {
             let v: Vec<f32> = (0..dim)
                 .map(|j| ((i * dim + j) as f32 * 0.03).sin())
                 .collect();
-            inserted.push(index.insert(v.as_slice(), &mut rng));
+            inserted.push(index.insert(v.as_slice()));
         }
 
         let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.1).cos()).collect();
@@ -445,14 +450,14 @@ mod tests {
 
     #[test]
     fn hnsw_arena_first_insert_is_entry() {
-        let mut rng = StdRng::seed_from_u64(1);
-        let mut index: HnswArena = HnswArena::new(4, 4, 8, 32, 32, top_k_quickselect);
-        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice(), &mut rng);
-        assert_eq!(id, 0);
-        assert_eq!(index.entry_point, Some(0));
+        let rng = StdRng::seed_from_u64(1);
+        let mut index: HnswArena = HnswArena::new(4, 4, 8, 32, 32, top_k_quickselect, rng);
+        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice());
+        assert_eq!(id, NodeId(0));
+        assert_eq!(index.entry_point, Some(NodeId(0)));
         let r = index.search(&[1.0, 0.0, 0.0, 0.0], 1, 8);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].0, 0);
+        assert_eq!(r[0].0, NodeId(0));
     }
 
     /// Matches SIFT recall test scale (10k × dim 128, same RNG seed) to catch arena block / id bugs.
@@ -463,13 +468,13 @@ mod tests {
         const M_MAX0: usize = 32;
         const N: usize = 10_000;
         const EF: usize = 200;
-        let mut rng = StdRng::seed_from_u64(0x_4853_4E57_5F53_4954);
-        let mut index: HnswArena = HnswArena::new(DIM, M, M_MAX0, EF, N, top_k_quickselect);
+        let rng = StdRng::seed_from_u64(0x_4853_4E57_5F53_4954);
+        let mut index: HnswArena = HnswArena::new(DIM, M, M_MAX0, EF, N, top_k_quickselect, rng);
         for i in 0..N {
             let v: Vec<f32> = (0..DIM)
                 .map(|j| ((i * DIM + j) as f32 * 0.03).sin())
                 .collect();
-            index.insert(v.as_slice(), &mut rng);
+            index.insert(v.as_slice());
         }
         let q: Vec<f32> = (0..DIM).map(|j| (j as f32 * 0.1).cos()).collect();
         let _ = index.search(&q, 10, 100);

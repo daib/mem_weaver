@@ -1,6 +1,6 @@
 # MemWeaver
 
-A vector database with predictable memory usage. Memory cost is a function of vectors, dimensions, and M — known before deployment, not discovered in production.
+A vector database with predictable memory usage and temporal partitioning. Memory cost is a function of vectors, dimensions, and M — known before deployment, not discovered in production.
 
 ```
 memory ≈ n × node_size
@@ -22,11 +22,11 @@ See [DESIGN.md](DESIGN.md) for the full technical motivation and comparison with
 
 ## Benchmarks
 
+### Arena vs Naive: Build and Search Performance
+
 Evaluated on AWS m5d.4xlarge (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) using the [SIFT1M](http://corpus-texmex.irisa.fr/) dataset (1M vectors, dim=128).
 
 **Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10, 50 search queries. Compiled with `target-cpu=native`.
-
-### Build and search performance
 
 | Implementation | Build time | Search (50 queries) | Speedup |
 |---|---|---|---|
@@ -35,13 +35,52 @@ Evaluated on AWS m5d.4xlarge (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) using th
 
 Arena allocation is **1.72x faster** to build and **1.71x faster** to query due to cache locality — collocating each vector with its HNSW edges means graph traversal accesses contiguous memory.
 
-### Memory predictability
+### Memory Predictability
 
 The arena implementation maintains a **constant ~8 MB peak overhead** throughout 1M vector insertion. The naive Vec-based implementation shows reallocation spikes of 21.6 MB at 270k vectors and 35.7 MB at 530k vectors as the underlying buffer doubles capacity.
 
 The arena implementation also uses **25% less total RSS** at 1M vectors (608 MB growth vs 759 MB), demonstrating that arena allocation eliminates the fragmentation that accumulates in general-purpose allocators.
 
-![Alt Text](docs/memory_comparison.png)
+![Memory comparison](docs/memory_comparison.png)
+
+---
+
+### TimeBucket: Temporal Partitioning
+
+TimeBucket partitions the HNSW index across time windows. Each bucket maintains an independent HNSW graph. Queries search across all relevant buckets and merge results with optional recency weighting.
+
+**Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10, 1000 queries, SIFT1M (1M vectors, dim=128), Apple M-series, StdRng.
+
+| Buckets | Vectors/bucket | Build time | HNSW search (1000q) | Mean recall@10 | P95 recall | Build speedup |
+|---------|---------------|-----------|---------------------|----------------|------------|---------------|
+| n=1 (baseline) | 1,000,000 | 156s | 523ms | 0.959 | 1.000 | 1.0x |
+| n=4 | 250,000 | 110s | 1,102ms | 0.905 | 1.000 | 1.42x |
+| n=8 | 125,000 | 84s | 2,038ms | 0.940 | 1.000 | 1.86x |
+| n=16 | 62,500 | 62s | 3,477ms | 0.949 | 1.000 | 2.52x |
+
+**Key findings:**
+
+- **Build time scales sublinearly** — 2.52x faster at n=16 with comparable recall quality
+- **P95 recall = 1.0 across all configurations** — at least 95% of queries return perfect recall regardless of bucket count
+- **Mean recall differences between n=4, n=8, n=16 are within noise** over 1000 queries — bucket count does not meaningfully degrade recall quality
+- **Query time scales linearly** with bucket count — the expected tradeoff for searching N independent graphs
+
+**RNG matters at scale:**
+
+Using `SmallRng` instead of `StdRng` at 1M vectors produces severely degraded results: mean recall drops from 0.959 to 0.799 and multiple queries return zero recall. `SmallRng`'s weaker statistical properties cause poor level assignment during HNSW construction at this scale. **Always use `StdRng`** for production workloads.
+
+| RNG | Mean recall | Min recall |
+|-----|-------------|------------|
+| StdRng | 0.959 | 0.40 |
+| SmallRng | 0.799 | 0.00 |
+
+**When to use TimeBucket:**
+
+- **Write-heavy workloads** — faster build time means lower insertion latency as the index grows
+- **Time-range queries** — search only recent buckets, skipping cold data entirely
+- **Memory tiering** — age out cold buckets to disk or object storage while keeping recent data hot
+- **Tune bucket count for your workload** — fewer buckets for query-heavy, more buckets for write-heavy or temporal filtering
+
 ---
 
 ## Arena Design
@@ -156,10 +195,13 @@ export SIFT1M_BASE_PATH=/path/to/sift
 RUSTFLAGS="-C target-cpu=native" cargo test --release
 
 # Arena only
-SIFT1M_HNSW_BENCH_VARIANT=arena SIFT1M_HNSW_MEM_LOG_BUILD_ITER=1 cargo bench -p index --bench hnsw_sift1m 2> arena.txt
+SIFT1M_HNSW_BENCH_VARIANT=arena SIFT1M_HNSW_BENCH_SAMPLE_SIZE=1 cargo bench -p index --bench hnsw_sift1m 2> arena.txt
 
-# Naive only  
-SIFT1M_HNSW_BENCH_VARIANT=naive SIFT1M_HNSW_MEM_LOG_BUILD_ITER=1 cargo bench -p index --bench hnsw_sift1m 2> naive.txt
+# Naive only
+SIFT1M_HNSW_BENCH_VARIANT=naive SIFT1M_HNSW_BENCH_SAMPLE_SIZE=1 cargo bench -p index --bench hnsw_sift1m 2> naive.txt
+
+# TimeBucket recall benchmark
+cargo test --release -p index --test sift1m_time_bucket_recall
 
 # Generate memory comparison chart
 python3 scripts/plot_memory.py arena.txt naive.txt
@@ -174,11 +216,14 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] NodeId encoding for O(1) node lookup
 - [x] SIMD distance computation (AVX2/AVX-512 via `wide` crate)
 - [x] Benchmarked on SIFT1M
-- [ ] Time-bucketed multi-HNSW for temporal relevance
-- [ ] Disk-backed cold tier (IVF + PQ)
+- [x] Time-bucketed multi-HNSW for temporal relevance
+- [x] Configurable aging policy (time-based, access-based, hybrid)
+- [x] Recency-weighted search with pluggable distance adjustment
+- [ ] Disk-backed cold tier (mmap arenas)
+- [ ] Object storage cold tier (S3/GCS/Azure via `object_store`)
+- [ ] pgvector comparison benchmarks
 - [ ] Parallel index construction
 - [ ] Edge compression (delta encoding)
-- [ ] pgvector comparison benchmarks
 
 ---
 

@@ -1,7 +1,10 @@
 use crate::hnsw::store::{HnswVectorStore, NaiveVectorStore};
 pub use common::types::NodeId;
 use common::DEFAULT_ARENA_CAPACITY;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{align_of, size_of};
+use std::path::Path;
 use vector::Arena;
 
 /// Alignment used for arena-backed node storage (`try_alloc_slice_aligned`).
@@ -66,6 +69,43 @@ impl NaiveNodeStore {
 const MAX_LEVEL: usize = 32;
 const LEVELS: usize = MAX_LEVEL + 1;
 pub const INVALID_NODE_ID: NodeId = NodeId(u32::MAX);
+
+/// Positional `read_exact` on a `&File` (no cursor mutation). Wraps the platform-specific
+/// `FileExt::read_exact_at` on Unix and `seek_read`-style emulation elsewhere.
+#[inline]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut remaining = buf;
+        let mut off = offset;
+        while !remaining.is_empty() {
+            let n = file.seek_read(remaining, off)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "read_at hit EOF before filling buffer",
+                ));
+            }
+            remaining = &mut remaining[n..];
+            off += n as u64;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, buf, offset);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional read not supported on this platform",
+        ))
+    }
+}
 
 // the layout of the node is:
 // - vector: f32[dim]
@@ -166,8 +206,25 @@ impl Node {
     }
 }
 
+enum NodeBlockStorage {
+    InMemory(Arena),
+    OnDisk(File),
+}
+
+impl NodeBlockStorage {
+    /// Base pointer of the in-memory mapping. Returns `null` when the storage is on disk
+    /// (callers must `swap_in()` before reads).
+    #[inline]
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            NodeBlockStorage::InMemory(a) => a.as_ptr(),
+            NodeBlockStorage::OnDisk(_) => std::ptr::null(),
+        }
+    }
+}
+
 pub struct NodeBlock {
-    arena: Arena,
+    storage: NodeBlockStorage,
     block_index: usize,
     len: usize,
     dim: usize,    // vector dimension
@@ -178,7 +235,9 @@ pub struct NodeBlock {
 impl NodeBlock {
     pub fn try_new(dim: usize, m: usize, m_max0: usize, block_index: usize) -> Option<Self> {
         Some(Self {
-            arena: Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY).unwrap(),
+            storage: NodeBlockStorage::InMemory(
+                Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY).unwrap(),
+            ),
             len: 0,
             block_index,
             dim,
@@ -190,6 +249,19 @@ impl NodeBlock {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// `true` when the block's arena is mapped in RAM and ready for reads/pushes.
+    #[inline]
+    pub fn is_in_memory(&self) -> bool {
+        matches!(self.storage, NodeBlockStorage::InMemory(_))
+    }
+
+    /// `true` when the block has been swapped to disk — read APIs will panic until
+    /// [`NodeBlock::swap_in`] restores it.
+    #[inline]
+    pub fn is_on_disk(&self) -> bool {
+        matches!(self.storage, NodeBlockStorage::OnDisk(_))
     }
 
     #[inline]
@@ -214,10 +286,15 @@ impl NodeBlock {
     // return the index of the new node in the block
     pub fn push_node(&mut self, vector: &[f32], max_level: usize) -> Option<NodeId> {
         let total = Node::total_size(self.dim, max_level, self.m, self.m_max0);
+        // Only the in-memory variant supports allocations; swapped-out blocks are sealed.
+        let arena = match &mut self.storage {
+            NodeBlockStorage::InMemory(a) => a,
+            NodeBlockStorage::OnDisk(_) => return None,
+        };
         // we need to align by 8 bytes at the moment
-        let node_storage = self
-            .arena
-            .try_alloc_slice_aligned::<u8>(total, DEFAULT_ALIGNMENT)?;
+        let node_storage = arena.try_alloc_slice_aligned::<u8>(total, DEFAULT_ALIGNMENT)?;
+        let arena_base = arena.as_ptr() as usize;
+        let node_offset = node_storage.as_ptr() as usize - arena_base;
         let p = node_storage.as_mut_ptr();
         unsafe {
             Node::vector(p, self.dim).copy_from_slice(vector);
@@ -227,19 +304,139 @@ impl NodeBlock {
 
         // add the node to the block
         self.len += 1;
-        Some(self.calculate_node_id(node_storage.as_ptr() as usize - self.arena.as_ptr() as usize))
+        Some(self.calculate_node_id(node_offset))
     }
 
     #[inline]
     fn calculate_node_address(&self, node_id: NodeId) -> *const u8 {
         let node_offset = NodeBlock::derive_node_offset(node_id);
-        self.arena.as_ptr().wrapping_add(node_offset) as *const u8
+        self.storage.as_ptr().wrapping_add(node_offset) as *const u8
     }
+
+    /// Read the vector for `node_id`. In-memory blocks return a slice borrowed from the
+    /// arena (zero copy). On-disk blocks read `dim * size_of::<f32>()` bytes at the node's
+    /// byte offset into `buf` and return a slice borrowed from `buf`.
+    pub fn vector_at<'a>(&'a self, node_id: NodeId, buf: &'a mut Vec<u8>) -> &'a [f32] {
+        match &self.storage {
+            NodeBlockStorage::InMemory(_) => {
+                let node_address = self.calculate_node_address(node_id);
+                // SAFETY: arena pointer is valid for the node's full extent; vector starts
+                // at the node base.
+                unsafe { std::slice::from_raw_parts(node_address.cast::<f32>(), self.dim) }
+            }
+            NodeBlockStorage::OnDisk(file) => {
+                let bytes = self.dim * size_of::<f32>();
+                buf.resize(bytes, 0);
+                let offset = NodeBlock::derive_node_offset(node_id) as u64;
+                read_at(file, buf.as_mut_slice(), offset)
+                    .expect("read vector from on-disk node block");
+                // SAFETY: `Vec<u8>` returns at least `align_of::<usize>()`-aligned memory
+                // on every supported allocator (which is ≥ align_of::<f32>() = 4). Debug
+                // builds verify; release builds rely on the allocator's contract.
+                debug_assert_eq!(
+                    buf.as_ptr() as usize % align_of::<f32>(),
+                    0,
+                    "Vec<u8> allocation must be f32-aligned"
+                );
+                unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const f32, self.dim) }
+            }
+        }
+    }
+
     // get the neighbors of the node at the given level
-    pub fn neighbors_at(&self, node_id: NodeId, level: usize) -> &[NodeId] {
+    pub fn neighbors_at(&self, node_id: NodeId, level: usize, buf: &mut Vec<u8>) -> &[NodeId] {
         assert!(level < LEVELS);
-        let node_address = self.calculate_node_address(node_id);
-        unsafe { Node::edges_at_level(node_address, self.dim, level, self.m, self.m_max0) }
+        match &self.storage {
+            NodeBlockStorage::InMemory(_) => {
+                let node_address = self.calculate_node_address(node_id);
+                unsafe { Node::edges_at_level(node_address, self.dim, level, self.m, self.m_max0) }
+            }
+            NodeBlockStorage::OnDisk(file) => {
+                let cap = if level == 0 { self.m_max0 } else { self.m };
+                let edge_bytes = cap * size_of::<NodeId>();
+                buf.resize(edge_bytes, 0);
+                // Absolute byte offset within the file: <node base> + <edges header> +
+                // <level offset within edge slab>.
+                let edges_within_node = Node::edges_byte_offset(self.dim)
+                    + if level == 0 {
+                        0
+                    } else {
+                        (self.m_max0 + (level - 1) * self.m) * size_of::<NodeId>()
+                    };
+                let abs_offset =
+                    (NodeBlock::derive_node_offset(node_id) + edges_within_node) as u64;
+                read_at(file, buf.as_mut_slice(), abs_offset)
+                    .expect("read edges from on-disk node block");
+                // SAFETY: buf is `cap * size_of::<NodeId>()` bytes; NodeId is repr(transparent)
+                // over u32 so the underlying byte layout matches.
+                unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const NodeId, cap) }
+            }
+        }
+    }
+
+    /// Write the block's in-memory arena bytes to `path` (truncating any existing file),
+    /// release the mapping, and transition to [`NodeBlockStorage::OnDisk`]. Errors if the
+    /// block is already on disk.
+    pub fn swap_out(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
+        let new_file = match &self.storage {
+            NodeBlockStorage::InMemory(arena) => {
+                let mapped = arena.mapped_bytes();
+                // SAFETY: `arena.as_ptr()` is valid for `mapped` bytes (the anonymous mmap).
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arena.as_ptr(), mapped) };
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(path)?;
+                file.write_all(bytes)?;
+                file.flush()?;
+                file
+            }
+            NodeBlockStorage::OnDisk(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "node block is already swapped out",
+                ));
+            }
+        };
+        // Assignment drops the previous storage (and the in-memory mmap inside it).
+        self.storage = NodeBlockStorage::OnDisk(new_file);
+        Ok(())
+    }
+
+    /// Restore an [`NodeBlockStorage::OnDisk`] block to memory by reading the file into a
+    /// fresh anonymous arena. Errors if the block is already in memory.
+    ///
+    /// The restored arena is sealed: bump = capacity, so further [`NodeBlock::push_node`]
+    /// calls return `None`. Reads (`neighbors_at`, etc.) work normally.
+    pub fn swap_in(&mut self) -> io::Result<()> {
+        let new_arena = match &mut self.storage {
+            NodeBlockStorage::OnDisk(file) => {
+                let len = file.metadata()?.len() as usize;
+                let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
+                // SAFETY: anonymous mmap is at least `mapped_bytes() >= len` bytes; we treat
+                // the first `len` bytes as the destination buffer for the file contents.
+                let dest: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena.mapped_bytes())
+                };
+                file.seek(SeekFrom::Start(0))?;
+                file.read_exact(&mut dest[..len])?;
+                // Seal: advance bump to the full capacity so future push_node calls return None.
+                let cap = arena.capacity_bytes();
+                let _ = arena.try_alloc_slice_aligned::<u8>(cap, 1);
+                arena
+            }
+            NodeBlockStorage::InMemory(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "node block is already in memory",
+                ));
+            }
+        };
+        self.storage = NodeBlockStorage::InMemory(new_arena);
+        Ok(())
     }
 
     // get the neighbors of the node at the given level
@@ -299,6 +496,50 @@ impl ArenaNodeStore {
         })
     }
 
+    /// Swap every in-memory block in this store to `dir`, one file per block named
+    /// `block_<block_index>.arena`. The directory is created if missing.
+    ///
+    /// Already-on-disk blocks are skipped (not an error). Returns the number of blocks
+    /// that transitioned from memory to disk in this call.
+    pub fn swap_out(&mut self, dir: impl AsRef<Path>) -> io::Result<usize> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let mut moved = 0;
+        for block in &mut self.blocks {
+            if block.is_on_disk() {
+                continue;
+            }
+            let path = dir.join(format!("block_{}.arena", block.block_index));
+            block.swap_out(&path)?;
+            moved += 1;
+        }
+        Ok(moved)
+    }
+
+    /// Swap every on-disk block back into memory. Already-in-memory blocks are skipped.
+    /// Returns the number of blocks restored.
+    pub fn swap_in(&mut self) -> io::Result<usize> {
+        let mut restored = 0;
+        for block in &mut self.blocks {
+            if block.is_in_memory() {
+                continue;
+            }
+            block.swap_in()?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
+    /// `true` if every block is currently swapped to disk.
+    pub fn all_on_disk(&self) -> bool {
+        !self.blocks.is_empty() && self.blocks.iter().all(|b| b.is_on_disk())
+    }
+
+    /// `true` if every block is currently in memory.
+    pub fn all_in_memory(&self) -> bool {
+        self.blocks.iter().all(|b| b.is_in_memory())
+    }
+
     #[inline]
     fn block(&self, block_index: usize) -> &NodeBlock {
         &self.blocks[block_index]
@@ -354,7 +595,10 @@ pub trait HnswNodeStore {
     fn len(&self) -> usize;
     /// Returns new internal id, or `None` if the store is at capacity.
     fn push_node(&mut self, vector: &[f32], max_level: usize) -> Option<NodeId>;
-    fn neighbors_at(&self, id: NodeId, level: usize) -> &[NodeId];
+    /// `buf` is scratch space used only by the arena/on-disk path to stage edge bytes; the
+    /// naive impl ignores it. Callers should reuse the same `Vec<u8>` across calls to avoid
+    /// per-query allocations.
+    fn neighbors_at<'a>(&'a self, id: NodeId, level: usize, buf: &'a mut Vec<u8>) -> &'a [NodeId];
     fn ensure_level(&mut self, id: NodeId, level: usize);
     // save the neighbors of a node to the edges at the given level
     fn save_neighbors(&mut self, id: NodeId, neighbors: &[NodeId], level: usize);
@@ -367,7 +611,20 @@ pub trait HnswNodeStore {
         level: usize,
         distance_fn: fn(&[f32], &[f32]) -> f32,
     ) -> bool;
-    fn vector_at(&self, id: NodeId) -> &[f32];
+    /// `buf` is scratch used only by the on-disk path; in-memory reads borrow from the
+    /// arena and ignore it. Callers should reuse the same `Vec<u8>` across calls.
+    fn vector_at<'a>(&'a self, id: NodeId, buf: &'a mut Vec<u8>) -> &'a [f32];
+
+    /// Move underlying storage units to disk under `dir`. Default: no-op (return `Ok(0)`)
+    /// for stores without arena-backed storage. [`ArenaNodeStore`] overrides this to
+    /// fan out across its blocks.
+    fn swap_out(&mut self, _dir: &Path) -> io::Result<usize> {
+        Ok(0)
+    }
+    /// Restore on-disk storage units to memory. Default: no-op.
+    fn swap_in(&mut self) -> io::Result<usize> {
+        Ok(0)
+    }
 }
 
 impl HnswNodeStore for NaiveNodeStore {
@@ -382,7 +639,7 @@ impl HnswNodeStore for NaiveNodeStore {
         Some(id)
     }
 
-    fn neighbors_at(&self, id: NodeId, level: usize) -> &[NodeId] {
+    fn neighbors_at<'a>(&'a self, id: NodeId, level: usize, _buf: &'a mut Vec<u8>) -> &'a [NodeId] {
         self.nodes[id.0 as usize].neighbors_at(level)
     }
 
@@ -415,8 +672,13 @@ impl HnswNodeStore for NaiveNodeStore {
             let neighbors = &self.nodes[src_id.0 as usize].neighbors[level];
             let mut idx = 0usize;
             let mut dist = f32::MIN;
+            let mut buf_a: Vec<u8> = Vec::new();
+            let mut buf_b: Vec<u8> = Vec::new();
             for i in 0..neighbors.len() {
-                let d = distance_fn(self.vector_at(src_id), self.vector_at(neighbors[i]));
+                let d = distance_fn(
+                    self.vector_at(src_id, &mut buf_a),
+                    self.vector_at(neighbors[i], &mut buf_b),
+                );
                 if d > dist {
                     idx = i;
                     dist = d;
@@ -425,7 +687,12 @@ impl HnswNodeStore for NaiveNodeStore {
             (idx, dist)
         };
 
-        let new_distance = distance_fn(self.vector_at(src_id), self.vector_at(dst_id));
+        let mut buf_a: Vec<u8> = Vec::new();
+        let mut buf_b: Vec<u8> = Vec::new();
+        let new_distance = distance_fn(
+            self.vector_at(src_id, &mut buf_a),
+            self.vector_at(dst_id, &mut buf_b),
+        );
         if new_distance > farthest_distance {
             return false;
         }
@@ -439,7 +706,7 @@ impl HnswNodeStore for NaiveNodeStore {
         true
     }
 
-    fn vector_at(&self, id: NodeId) -> &[f32] {
+    fn vector_at<'a>(&'a self, id: NodeId, _buf: &'a mut Vec<u8>) -> &'a [f32] {
         self.vector_store.vector_at(id)
     }
 }
@@ -475,10 +742,10 @@ impl HnswNodeStore for ArenaNodeStore {
         }
     }
 
-    fn neighbors_at(&self, id: NodeId, level: usize) -> &[NodeId] {
+    fn neighbors_at<'a>(&'a self, id: NodeId, level: usize, buf: &'a mut Vec<u8>) -> &'a [NodeId] {
         let block_index = NodeBlock::derive_block_index(id);
         match self.blocks.get(block_index) {
-            Some(block) => block.neighbors_at(id, level),
+            Some(block) => block.neighbors_at(id, level, buf),
             None => &[],
         }
     }
@@ -536,13 +803,16 @@ impl HnswNodeStore for ArenaNodeStore {
         // `neighbors_at_mut` borrows `self` mutably; `vector_at` needs `&self`.
         let neighbor_ids: Vec<NodeId> = {
             let block = self.block(src_block_index);
-            block.neighbors_at(src_id, level).to_vec()
+            let mut scratch: Vec<u8> = Vec::new();
+            block.neighbors_at(src_id, level, &mut scratch).to_vec()
         };
 
         let (farthest_idx, farthest_dist, removed_neighbor, found) = {
             let mut farthest_neighbor_index = 0usize;
             let mut farthest_distance = f32::MIN;
             let mut found = false;
+            let mut buf_a: Vec<u8> = Vec::new();
+            let mut buf_b: Vec<u8> = Vec::new();
             for i in 0..neighbor_ids.len() {
                 let nid = neighbor_ids[i];
                 if nid == INVALID_NODE_ID {
@@ -552,7 +822,10 @@ impl HnswNodeStore for ArenaNodeStore {
                 if nb_i >= self.blocks.len() {
                     continue;
                 }
-                let distance = distance_fn(self.vector_at(src_id), self.vector_at(nid));
+                let distance = distance_fn(
+                    self.vector_at(src_id, &mut buf_a),
+                    self.vector_at(nid, &mut buf_b),
+                );
                 if !found || distance >= farthest_distance {
                     farthest_neighbor_index = i;
                     farthest_distance = distance;
@@ -571,7 +844,12 @@ impl HnswNodeStore for ArenaNodeStore {
             return false;
         }
 
-        let new_distance = distance_fn(self.vector_at(src_id), self.vector_at(dst_id));
+        let mut buf_a: Vec<u8> = Vec::new();
+        let mut buf_b: Vec<u8> = Vec::new();
+        let new_distance = distance_fn(
+            self.vector_at(src_id, &mut buf_a),
+            self.vector_at(dst_id, &mut buf_b),
+        );
         if new_distance > farthest_dist {
             return false;
         }
@@ -589,11 +867,19 @@ impl HnswNodeStore for ArenaNodeStore {
         true
     }
 
-    fn vector_at(&self, id: NodeId) -> &[f32] {
+    fn vector_at<'a>(&'a self, id: NodeId, buf: &'a mut Vec<u8>) -> &'a [f32] {
         let block_index = NodeBlock::derive_block_index(id);
         let block = self.block(block_index);
-        let node_address = block.calculate_node_address(id);
-        unsafe { Node::vector(node_address as *mut u8, self.dim) }
+        block.vector_at(id, buf)
+    }
+
+    fn swap_out(&mut self, dir: &Path) -> io::Result<usize> {
+        // Delegate to the inherent method on `ArenaNodeStore` (UFCS to disambiguate).
+        ArenaNodeStore::swap_out(self, dir)
+    }
+
+    fn swap_in(&mut self) -> io::Result<usize> {
+        ArenaNodeStore::swap_in(self)
     }
 }
 #[cfg(test)]
@@ -616,8 +902,9 @@ mod tests {
         assert_eq!(b, NodeId(1));
         assert_eq!(store.len(), 2);
 
-        assert_eq!(store.vector_at(NodeId(0)), &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(store.vector_at(NodeId(1)), &[5.0, 6.0, 7.0, 8.0]);
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(store.vector_at(NodeId(0), &mut buf), &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(store.vector_at(NodeId(1), &mut buf), &[5.0, 6.0, 7.0, 8.0]);
         assert_eq!(store.nodes[0].max_level(), 1);
         assert_eq!(store.nodes[1].max_level(), 0);
     }
@@ -631,9 +918,13 @@ mod tests {
         let n1 = vec![NodeId(20)];
         store.save_neighbors(id, &n0, 0);
         store.save_neighbors(id, &n1, 1);
-        assert_eq!(store.neighbors_at(id, 0), &[NodeId(10), NodeId(11)]);
-        assert_eq!(store.neighbors_at(id, 1), &[NodeId(20)]);
-        assert!(store.neighbors_at(id, 2).is_empty());
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(
+            store.neighbors_at(id, 0, &mut buf),
+            &[NodeId(10), NodeId(11)]
+        );
+        assert_eq!(store.neighbors_at(id, 1, &mut buf), &[NodeId(20)]);
+        assert!(store.neighbors_at(id, 2, &mut buf).is_empty());
     }
 
     /// [`GraphNode::ensure_level`] grows the neighbor slot table when connecting at a higher level
@@ -681,7 +972,11 @@ mod tests {
             let id1 = store.push_node(&[1.0, 0.0], 1).expect("n1");
             assert!(store.add_directed_edge(id0, id1, 0, euclidean_distance_sq));
             assert!(store.add_directed_edge(id0, id1, 0, euclidean_distance_sq));
-            assert_eq!(nonzero_neighbors(store.neighbors_at(id0, 0)), vec![id1]);
+            let mut buf: Vec<u8> = Vec::new();
+            assert_eq!(
+                nonzero_neighbors(store.neighbors_at(id0, 0, &mut buf)),
+                vec![id1]
+            );
         }
     }
 
@@ -704,7 +999,8 @@ mod tests {
             assert!(store.add_directed_edge(id0, id1, 0, euclidean_distance_sq));
             assert!(store.add_directed_edge(id0, id2, 0, euclidean_distance_sq));
             assert!(store.add_directed_edge(id0, id3, 0, euclidean_distance_sq));
-            let present = nonzero_neighbors(store.neighbors_at(id0, 0));
+            let mut buf: Vec<u8> = Vec::new();
+            let present = nonzero_neighbors(store.neighbors_at(id0, 0, &mut buf));
             assert_eq!(present.len(), 2);
             assert!(present.contains(&id1));
             assert!(present.contains(&id3));
@@ -733,8 +1029,9 @@ mod tests {
             assert!(store.add_directed_edge(id1, id0, 0, euclidean_distance_sq));
             assert!(store.add_directed_edge(id2, id0, 0, euclidean_distance_sq));
             assert!(store.add_directed_edge(id0, id3, 0, euclidean_distance_sq));
-            assert!(!nonzero_neighbors(store.neighbors_at(id2, 0)).contains(&id0));
-            assert!(nonzero_neighbors(store.neighbors_at(id1, 0)).contains(&id0));
+            let mut buf: Vec<u8> = Vec::new();
+            assert!(!nonzero_neighbors(store.neighbors_at(id2, 0, &mut buf)).contains(&id0));
+            assert!(nonzero_neighbors(store.neighbors_at(id1, 0, &mut buf)).contains(&id0));
         }
     }
 
@@ -790,7 +1087,8 @@ mod tests {
                 let num_neighbors = if l == 0 { M_MAX0 } else { M };
                 let expected_neighbors =
                     vec![NodeId((i * (max_level + 10) + l) as u32); num_neighbors];
-                let actual_neighbors = node_block.neighbors_at(node_id, l);
+                let mut buf: Vec<u8> = Vec::new();
+                let actual_neighbors = node_block.neighbors_at(node_id, l, &mut buf);
                 assert_eq!(actual_neighbors.len(), num_neighbors);
                 assert_eq!(actual_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
 
@@ -873,8 +1171,9 @@ mod tests {
             let max_level = ((i + 6) * 11usize).pow(2).min(MAX_LEVEL);
 
             // check data by arena storage api
+            let mut buf: Vec<u8> = Vec::new();
             assert_eq!(
-                store.vector_at(node_id),
+                store.vector_at(node_id, &mut buf),
                 stored.as_slice(),
                 "vector at node {node_id:?} should be {stored:?}"
             );
@@ -884,10 +1183,226 @@ mod tests {
                 let num_neighbors = if l == 0 { M_MAX0 } else { M };
                 let expected_neighbors =
                     vec![NodeId((i * (max_level + 10) + l) as u32); num_neighbors];
-                let actual_neighbors = store.neighbors_at(node_id, l);
+                let mut buf: Vec<u8> = Vec::new();
+                let actual_neighbors = store.neighbors_at(node_id, l, &mut buf);
                 assert_eq!(actual_neighbors.len(), num_neighbors);
                 assert_eq!(actual_neighbors, expected_neighbors.as_slice(), "neighbors at i {i} node {node_id:?} at level {l} should be {expected_neighbors:?}");
             }
         }
+    }
+
+    /// Unique temp dir for swap tests; caller responsible for cleanup.
+    fn unique_swap_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mem_weaver_nodeblock_{tag}_{pid}_{nanos}_{n}"))
+    }
+
+    /// Deletes the directory tree when dropped.
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn node_block_swap_round_trip_preserves_neighbors() {
+        const DIM: usize = 8;
+        const M: usize = 4;
+        const M_MAX0: usize = 8;
+        let dir = unique_swap_dir("rt");
+        let _guard = DirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).expect("mk dir");
+
+        let mut block = NodeBlock::try_new(DIM, M, M_MAX0, 0).expect("alloc block");
+        // Insert two nodes and write neighbors at level 0 + level 1.
+        let v0 = vec![1.0_f32; DIM];
+        let v1 = vec![2.0_f32; DIM];
+        let id0 = block.push_node(&v0, 1).expect("push v0");
+        let id1 = block.push_node(&v1, 1).expect("push v1");
+        block.save_neighbors(id0, &[id1], 0);
+        block.save_neighbors(id1, &[id0], 0);
+        block.save_neighbors(id0, &[id1], 1);
+
+        // Capture the in-memory neighbors as ground truth before swap.
+        let mut buf: Vec<u8> = Vec::new();
+        let in_mem_id0_l0 = block.neighbors_at(id0, 0, &mut buf).to_vec();
+        let in_mem_id1_l0 = block.neighbors_at(id1, 0, &mut buf).to_vec();
+        let in_mem_id0_l1 = block.neighbors_at(id0, 1, &mut buf).to_vec();
+
+        let path = dir.join("block_0.arena");
+        block.swap_out(&path).expect("swap_out");
+        assert!(block.is_on_disk());
+        assert!(!block.is_in_memory());
+        assert!(path.exists());
+
+        // Reads must work while swapped out — this is the on-disk `read_at` path.
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(
+            block.neighbors_at(id0, 0, &mut buf),
+            in_mem_id0_l0.as_slice()
+        );
+        assert_eq!(
+            block.neighbors_at(id1, 0, &mut buf),
+            in_mem_id1_l0.as_slice()
+        );
+        assert_eq!(
+            block.neighbors_at(id0, 1, &mut buf),
+            in_mem_id0_l1.as_slice()
+        );
+        // And the convenience nonzero_neighbors filter agrees on the on-disk read.
+        assert_eq!(
+            nonzero_neighbors(block.neighbors_at(id0, 0, &mut buf)),
+            vec![id1]
+        );
+        assert_eq!(
+            nonzero_neighbors(block.neighbors_at(id1, 0, &mut buf)),
+            vec![id0]
+        );
+        assert_eq!(
+            nonzero_neighbors(block.neighbors_at(id0, 1, &mut buf)),
+            vec![id1]
+        );
+
+        block.swap_in().expect("swap_in");
+        assert!(block.is_in_memory());
+
+        // Reads after swap_in observe the same neighbor rows.
+        assert_eq!(
+            block.neighbors_at(id0, 0, &mut buf),
+            in_mem_id0_l0.as_slice()
+        );
+        assert_eq!(
+            block.neighbors_at(id1, 0, &mut buf),
+            in_mem_id1_l0.as_slice()
+        );
+        assert_eq!(
+            block.neighbors_at(id0, 1, &mut buf),
+            in_mem_id0_l1.as_slice()
+        );
+
+        // Sealed contract: no further pushes after a round-trip.
+        let v2 = vec![3.0_f32; DIM];
+        assert!(
+            block.push_node(&v2, 0).is_none(),
+            "swapped-in block must be sealed"
+        );
+    }
+
+    #[test]
+    fn node_block_neighbors_at_reads_from_disk_when_swapped_out() {
+        // Multi-node, multi-level block: verifies the on-disk offset math
+        // (node_offset + edges_header + per-level offset) for several (id, level) combinations.
+        const DIM: usize = 16;
+        const M: usize = 4;
+        const M_MAX0: usize = 8;
+        const N: usize = 5;
+        const MAX_L: usize = 2;
+        let dir = unique_swap_dir("read_from_disk");
+        let _guard = DirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).expect("mk dir");
+
+        let mut block =
+            NodeBlock::try_new(DIM, M, M_MAX0, 7 /* nonzero block_index */).expect("alloc block");
+        let mut ids: Vec<NodeId> = Vec::with_capacity(N);
+        for i in 0..N {
+            let v: Vec<f32> = (0..DIM).map(|j| (i * DIM + j) as f32).collect();
+            ids.push(block.push_node(&v, MAX_L).expect("push"));
+        }
+        // Distinctive neighbor rows per (id, level) so an offset bug would mis-route them.
+        for (i, &id) in ids.iter().enumerate() {
+            for l in 0..=MAX_L {
+                let cap = if l == 0 { M_MAX0 } else { M };
+                let neighbors: Vec<NodeId> = (0..cap)
+                    .map(|j| NodeId(((i + 1) * 1000 + l * 100 + j) as u32))
+                    .collect();
+                block.save_neighbors(id, &neighbors, l);
+            }
+        }
+
+        // Snapshot every (id, level) row while in memory.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut snapshots: Vec<(NodeId, usize, Vec<NodeId>)> = Vec::new();
+        for &id in &ids {
+            for l in 0..=MAX_L {
+                let row = block.neighbors_at(id, l, &mut buf).to_vec();
+                snapshots.push((id, l, row));
+            }
+        }
+
+        block.swap_out(&dir.join("block.arena")).expect("swap_out");
+        assert!(block.is_on_disk());
+
+        // Read everything back while the block is still on disk; must match the snapshot.
+        for (id, l, expected) in &snapshots {
+            let got = block.neighbors_at(*id, *l, &mut buf);
+            assert_eq!(
+                got,
+                expected.as_slice(),
+                "on-disk read mismatch at id={id:?} level={l}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_block_swap_out_on_already_on_disk_errors() {
+        let dir = unique_swap_dir("double_out");
+        let _guard = DirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).expect("mk dir");
+
+        let mut block = NodeBlock::try_new(4, 4, 8, 0).expect("alloc");
+        let _ = block.push_node(&[0.0_f32; 4], 0).expect("push");
+        let p = dir.join("block_0.arena");
+        block.swap_out(&p).expect("first out");
+        let err = block.swap_out(&p).expect_err("second swap_out must error");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(block.is_on_disk(), "state unchanged on error");
+    }
+
+    #[test]
+    fn node_block_swap_in_on_in_memory_errors() {
+        let mut block = NodeBlock::try_new(4, 4, 8, 0).expect("alloc");
+        let err = block
+            .swap_in()
+            .expect_err("swap_in on hot block must error");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn arena_node_store_swap_fans_out_over_blocks() {
+        const DIM: usize = 4;
+        let dir = unique_swap_dir("store_fanout");
+        let _guard = DirGuard(dir.clone());
+
+        let mut store = ArenaNodeStore::try_new(DIM, 4, 8).expect("new store");
+        // Force at least 2 blocks by pushing many nodes — but DEFAULT_ARENA_CAPACITY is large,
+        // so just push 3 and verify swap is idempotent across all of them.
+        for i in 0..3 {
+            let v = vec![i as f32; DIM];
+            store.push_node(&v, 0).expect("push");
+        }
+        assert!(store.all_in_memory());
+
+        let moved = store.swap_out(&dir).expect("swap_out store");
+        assert!(moved >= 1, "at least one block must have been swapped out");
+        assert!(store.all_on_disk());
+
+        // Idempotent: swap_out on already-on-disk store moves 0 blocks (no error).
+        let moved_again = store.swap_out(&dir).expect("idempotent swap_out");
+        assert_eq!(moved_again, 0);
+
+        let restored = store.swap_in().expect("swap_in store");
+        assert_eq!(
+            restored, moved,
+            "every previously-cold block must be restored"
+        );
+        assert!(store.all_in_memory());
     }
 }

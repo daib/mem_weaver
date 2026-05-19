@@ -327,6 +327,35 @@ impl TimeBucketIndex {
     pub fn evict_oldest(&mut self) -> Option<BucketSeq> {
         self.buckets.pop_back().map(|b| b.seq)
     }
+
+    /// Move the bucket identified by `seq` from RAM to disk under `dir`. The bucket
+    /// stays in the index (search via `time_range` still finds it) — only its
+    /// underlying memory mapping is released. Calls [`HnswIndex::swap_out`] on the
+    /// inner index, which fans out across its arena blocks.
+    ///
+    /// Returns `Ok(true)` if a bucket with that `seq` was found and swapped, `Ok(false)`
+    /// if no such bucket exists. Forwards any I/O error from the underlying swap.
+    pub fn swap_bucket_out(
+        &mut self,
+        seq: BucketSeq,
+        dir: &std::path::Path,
+    ) -> std::io::Result<bool> {
+        let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) else {
+            return Ok(false);
+        };
+        bucket.index.swap_out(dir)?;
+        Ok(true)
+    }
+
+    /// Restore the bucket identified by `seq` from disk to RAM. Mirror of
+    /// [`TimeBucketIndex::swap_bucket_out`].
+    pub fn swap_bucket_in(&mut self, seq: BucketSeq) -> std::io::Result<bool> {
+        let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) else {
+            return Ok(false);
+        };
+        bucket.index.swap_in()?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -592,5 +621,130 @@ mod tests {
                 top_k_quickselect
             )
             .is_empty());
+    }
+
+    // ── swap_bucket_out / swap_bucket_in ─────────────────────────────────────
+
+    /// Unique temp dir for time-bucket swap tests; caller responsible for cleanup.
+    fn unique_swap_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("mem_weaver_time_bucket_{tag}_{pid}_{nanos}_{n}"))
+    }
+
+    /// Recursively deletes the directory on drop so tests stay self-cleaning on panic.
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn swap_bucket_out_unknown_seq_returns_false() {
+        let root = unique_swap_dir("unknown_seq");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0)); // creates one bucket (seq=0)
+
+        let dir = root.join("seq_999");
+        let moved = idx
+            .swap_bucket_out(BucketSeq(999), &dir)
+            .expect("no IO when seq not found");
+        assert!(!moved);
+        assert!(!dir.exists(), "no files written when bucket absent");
+
+        let restored = idx.swap_bucket_in(BucketSeq(999)).expect("no IO");
+        assert!(!restored);
+    }
+
+    #[test]
+    fn swap_bucket_out_then_in_preserves_search_results() {
+        // Three buckets, distinct contents per bucket. Swap the middle one out, then back
+        // in, and verify search returns the same result list as before the swap.
+        //
+        // Note: we explicitly do NOT call `search` while a bucket is on disk. Although
+        // `neighbors_at` supports the on-disk read path, `vector_at` does not yet (it would
+        // need the same buf-plumbing); search inside a cold bucket would dereference a null
+        // pointer. The round-trip test still validates that swap_out → swap_in is lossless.
+        let root = unique_swap_dir("rt_search");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(1);
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0)); // bucket 0 (seq=0)
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(1)); // bucket 1 (seq=1)
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(2)); // bucket 2 (seq=2)
+        assert_eq!(idx.bucket_count(), 3);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(before.len(), 3, "all three inserts retrievable before swap");
+
+        let dir_seq1 = root.join("seq_1");
+        let moved = idx
+            .swap_bucket_out(BucketSeq(1), &dir_seq1)
+            .expect("swap_out");
+        assert!(moved, "bucket seq=1 must be found and swapped");
+        assert!(dir_seq1.exists(), "swap_out wrote files");
+
+        let restored = idx.swap_bucket_in(BucketSeq(1)).expect("swap_in");
+        assert!(restored);
+
+        let after = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(after, before, "search results identical after swap_in");
+    }
+
+    /// `vector_at` and `neighbors_at` are both buf-plumbed for the on-disk path, so search
+    /// across a cold bucket works end-to-end via the trait object.
+    #[test]
+    fn search_across_cold_bucket_works_after_vector_at_buf_plumbing() {
+        let root = unique_swap_dir("mixed_range");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0));
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10));
+        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20));
+
+        idx.swap_bucket_out(bid1.bucket_seq, &root.join("seq_1"))
+            .expect("swap_out");
+
+        let query = [0.0; 4];
+        let all = idx.search(
+            &query,
+            10,
+            32,
+            |_, d| d,
+            Some(ts(0)..ts(30)),
+            top_k_quickselect,
+        );
+        let seqs: std::collections::HashSet<_> = all.iter().map(|b| b.bucket_seq).collect();
+        assert!(seqs.contains(&bid0.bucket_seq));
+        assert!(seqs.contains(&bid1.bucket_seq), "cold bucket missing");
+        assert!(seqs.contains(&bid2.bucket_seq));
+    }
+
+    #[test]
+    fn double_swap_out_on_same_bucket_is_idempotent() {
+        // ArenaNodeStore::swap_out skips already-on-disk blocks, so calling
+        // swap_bucket_out twice returns Ok(true) both times without error. After the
+        // round-trip the bucket can still be swapped back in.
+        let root = unique_swap_dir("double_out");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0));
+        let seq = BucketSeq(0);
+
+        assert!(idx
+            .swap_bucket_out(seq, &root.join("seq_0"))
+            .expect("first out"));
+        assert!(idx
+            .swap_bucket_out(seq, &root.join("seq_0"))
+            .expect("second out (idempotent, no-op)"));
+        assert!(idx.swap_bucket_in(seq).expect("swap_in still works"));
     }
 }

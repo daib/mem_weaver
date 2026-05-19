@@ -16,6 +16,12 @@ pub trait HnswIndex {
     fn len(&self) -> usize;
     fn insert(&mut self, vector: &[f32]) -> NodeId;
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)>;
+    /// Move the index's hot data to disk under `dir`. Returns the number of underlying
+    /// storage units (e.g. arena node blocks) that transitioned to on-disk state.
+    /// No-op for indexes without arena-backed storage (e.g. naive heap).
+    fn swap_out(&mut self, dir: &std::path::Path) -> std::io::Result<usize>;
+    /// Restore on-disk storage units to memory. Returns the number restored.
+    fn swap_in(&mut self) -> std::io::Result<usize>;
 }
 
 /// HNSW index: `N` holds the graph ([`NaiveNodeStore`] or [`ArenaNodeStore`](super::nodes::ArenaNodeStore)), `S` holds vectors.
@@ -96,6 +102,14 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)> {
         Hnsw::search(self, query, k, ef)
     }
+
+    fn swap_out(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
+        self.graph.swap_out(dir)
+    }
+
+    fn swap_in(&mut self) -> std::io::Result<usize> {
+        self.graph.swap_in()
+    }
 }
 
 impl Hnsw<ArenaNodeStore> {
@@ -142,15 +156,16 @@ impl Hnsw<ArenaNodeStore> {
 }
 
 impl<N: HnswNodeStore> Hnsw<N> {
-    /// Lookup stored vector (internal id).
+    /// Lookup stored vector (internal id). `buf` is scratch for the on-disk path;
+    /// in-memory reads ignore it.
     #[inline]
-    pub fn vector_at(&self, id: NodeId) -> &[f32] {
-        self.graph.vector_at(id)
+    pub fn vector_at<'a>(&'a self, id: NodeId, buf: &'a mut Vec<u8>) -> &'a [f32] {
+        self.graph.vector_at(id, buf)
     }
 
     #[inline]
-    fn dist_sq(&self, q: &[f32], id: NodeId) -> f32 {
-        euclidean_distance_sq(q, self.graph.vector_at(id))
+    fn dist_sq(&self, q: &[f32], id: NodeId, buf: &mut Vec<u8>) -> f32 {
+        euclidean_distance_sq(q, self.graph.vector_at(id, buf))
     }
 
     #[must_use]
@@ -268,14 +283,19 @@ impl<N: HnswNodeStore> Hnsw<N> {
     }
 
     fn greedy_closest(&self, q: &[f32], mut best: NodeId, level: usize) -> NodeId {
-        let mut best_d = self.dist_sq(q, best);
+        // Independent scratch buffers: `neighbor_buf` is borrowed for the duration of the
+        // for-loop iteration; `vector_buf` is needed inside the body by `dist_sq`. They
+        // cannot share storage because the neighbor slice borrow is live during dist_sq.
+        let mut neighbor_buf: Vec<u8> = Vec::new();
+        let mut vector_buf: Vec<u8> = Vec::new();
+        let mut best_d = self.dist_sq(q, best, &mut vector_buf);
         loop {
             let mut improved = false;
-            for &nb in self.graph.neighbors_at(best, level) {
+            for &nb in self.graph.neighbors_at(best, level, &mut neighbor_buf) {
                 if nb == INVALID_NODE_ID {
                     continue;
                 }
-                let d = self.dist_sq(q, nb);
+                let d = self.dist_sq(q, nb, &mut vector_buf);
                 if d < best_d {
                     best_d = d;
                     best = nb;
@@ -293,7 +313,10 @@ impl<N: HnswNodeStore> Hnsw<N> {
         let mut visited = HashSet::with_capacity(2 * ef);
         visited.insert(ep);
 
-        let d0 = self.dist_sq(q, ep);
+        let mut neighbor_buf: Vec<u8> = Vec::new();
+        let mut vector_buf: Vec<u8> = Vec::new();
+
+        let d0 = self.dist_sq(q, ep, &mut vector_buf);
         let mut w: BinaryHeap<(OrdF32, NodeId)> = BinaryHeap::new();
         w.push((OrdF32(d0), ep));
         let mut candidates: BinaryHeap<Reverse<(OrdF32, NodeId)>> = BinaryHeap::new();
@@ -306,12 +329,12 @@ impl<N: HnswNodeStore> Hnsw<N> {
                     break;
                 }
             }
-            for &e in self.graph.neighbors_at(c, level) {
+            for &e in self.graph.neighbors_at(c, level, &mut neighbor_buf) {
                 if e == INVALID_NODE_ID {
                     continue;
                 }
                 if visited.insert(e) {
-                    let de = self.dist_sq(q, e);
+                    let de = self.dist_sq(q, e, &mut vector_buf);
                     if w.len() < ef {
                         w.push((OrdF32(de), e));
                         candidates.push(Reverse((OrdF32(de), e)));
@@ -381,10 +404,14 @@ mod tests {
 
         let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.1).cos()).collect();
 
+        let mut buf: Vec<u8> = Vec::new();
         let mut brute: Vec<(NodeId, f32)> = (0..n)
             .map(|i| {
                 let id = NodeId(i as u32);
-                (id, euclidean_distance_sq(&query, index.vector_at(id)))
+                (
+                    id,
+                    euclidean_distance_sq(&query, index.vector_at(id, &mut buf)),
+                )
             })
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1));
@@ -430,9 +457,15 @@ mod tests {
 
         let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.1).cos()).collect();
 
+        let mut buf: Vec<u8> = Vec::new();
         let mut brute: Vec<(NodeId, f32)> = inserted
             .iter()
-            .map(|&id| (id, euclidean_distance_sq(&query, index.vector_at(id))))
+            .map(|&id| {
+                (
+                    id,
+                    euclidean_distance_sq(&query, index.vector_at(id, &mut buf)),
+                )
+            })
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1));
         let gt: Vec<NodeId> = brute.iter().take(10).map(|(i, _)| *i).collect();

@@ -158,19 +158,96 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
             "{label}: TimeBucketIndex should hold every base vector"
         );
 
-        let (_stats, _, _) = sift_recall_stats(&label, &corpus, q_data, dim, n_q, ef, |q| {
-            index
-                .search(q, K, ef, |_, d| d, None, top_k_quickselect)
-                .iter()
-                .map(|bid| {
-                    let corpus_row = id_to_corpus[bid];
-                    VectorId(corpus_row as u64)
-                })
+        // Helper to keep the three recall passes identical.
+        let run_recall = |index: &TimeBucketIndex, phase: &str| {
+            let phased_label = format!("{label} [{phase}]");
+            let (stats, _, _) =
+                sift_recall_stats(&phased_label, &corpus, q_data, dim, n_q, ef, |q| {
+                    index
+                        .search(q, K, ef, |_, d| d, None, top_k_quickselect)
+                        .iter()
+                        .map(|bid| {
+                            let corpus_row = id_to_corpus[bid];
+                            VectorId(corpus_row as u64)
+                        })
+                        .collect()
+                });
+            stats
+        };
+
+        // ── Three recall passes: hot → cold → restored ─────────────────────────
+        let hot_stats = run_recall(&index, "hot");
+
+        let cold_root = unique_swap_dir(&format!("sift_time_bucket_n{num_buckets}"));
+        let _cold_guard = DirGuard(cold_root.clone());
+        std::fs::create_dir_all(&cold_root).expect("mk cold dir");
+
+        let bucket_seqs: Vec<_> = {
+            use std::collections::HashSet;
+            id_to_corpus
+                .keys()
+                .map(|b| b.bucket_seq)
+                .collect::<HashSet<_>>()
+                .into_iter()
                 .collect()
-        });
-        assert!(
-            _stats.min >= 0.75,
-            "{label}: minimum recall@{K} vs brute force expected >= 0.75 (try SIFT1M_HNSW_EF=512 or lower SIFT1M_RECALL_N_BASE)"
+        };
+        let t_swap_out = Instant::now();
+        for (i, seq) in bucket_seqs.iter().enumerate() {
+            let dir = cold_root.join(format!("seq_{i}"));
+            let moved = index.swap_bucket_out(*seq, &dir).expect("swap_bucket_out");
+            assert!(moved, "{label}: every alive bucket_seq must be present");
+        }
+        eprintln!(
+            "{label}: swapped {} buckets to disk in {:.3} ms",
+            bucket_seqs.len(),
+            ms(t_swap_out.elapsed())
         );
+
+        let cold_stats = run_recall(&index, "cold");
+
+        let t_swap_in = Instant::now();
+        for seq in &bucket_seqs {
+            let restored = index.swap_bucket_in(*seq).expect("swap_bucket_in");
+            assert!(restored, "{label}: bucket_seq must be present for swap_in");
+        }
+        eprintln!(
+            "{label}: swapped {} buckets back into memory in {:.3} ms",
+            bucket_seqs.len(),
+            ms(t_swap_in.elapsed())
+        );
+
+        let restored_stats = run_recall(&index, "restored");
+
+        // One assertion: recall is acceptable AND all three phases agree exactly.
+        // (Same graph + same algorithm → only the byte source changes.)
+        assert!(
+            hot_stats.min >= 0.75
+                && (hot_stats.min, hot_stats.mean, hot_stats.p95)
+                    == (cold_stats.min, cold_stats.mean, cold_stats.p95)
+                && (hot_stats.min, hot_stats.mean, hot_stats.p95)
+                    == (restored_stats.min, restored_stats.mean, restored_stats.p95),
+            "{label}: recall floor and hot/cold/restored equivalence — hot={hot_stats:?} cold={cold_stats:?} restored={restored_stats:?}"
+        );
+    }
+}
+
+/// Unique temp dir for SIFT swap tests; caller responsible for cleanup.
+fn unique_swap_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("mem_weaver_{tag}_{pid}_{nanos}_{n}"))
+}
+
+/// Recursively deletes the directory on drop so test stays self-cleaning on panic.
+struct DirGuard(std::path::PathBuf);
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

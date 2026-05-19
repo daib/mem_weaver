@@ -11,8 +11,8 @@ rustflags = ["-C", "target-cpu=native"]
 # SIFT1M_BASE_PATH = "/absolute/path/to/sift"
 
 # Optional overrides — uncomment as needed:
-# SIFT1M_RECALL_N_BASE = "100000"
-# SIFT1M_RECALL_N_QUERIES = "100"
-# SIFT1M_HNSW_EF = "256"
-# SIFT1M_HNSW_EF_CONSTRUCTION = "400"
-# SIFT1M_TIME_BUCKET_COUNTS = "1,4,16,64"
+# SIFT1M_RECALL_N_BASE = "1000000"
+# SIFT1M_RECALL_N_QUERIES = "1000"
+# SIFT1M_HNSW_EF = "100"
+# SIFT1M_HNSW_EF_CONSTRUCTION = "40"
+# SIFT1M_TIME_BUCKET_COUNTS = "8"

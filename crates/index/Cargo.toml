@@ -5,12 +5,17 @@ edition = "2021"
 description = "Approximate nearest-neighbor indexes (HNSW)"
 
 [dependencies]
-common = { path = "../common" }
+common = { path = "../common", features = ["s3"] }
 vector = { path = "../vector" }
 rand = "0.8"
+object_store = { workspace = true, features = ["aws"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tokio = { workspace = true }
 
 [[bench]]
 name = "hnsw_sift1m"

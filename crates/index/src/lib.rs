@@ -4,9 +4,11 @@
 //! [`HnswVectorStore`] implementations), and [`TimeBucketIndex`] for streaming
 //! workloads that need temporal partitioning and recency-weighted search.
 
+pub mod blob;
 mod hnsw;
 mod time_bucket;
 
+pub use blob::{download_arena_dir, upload_arena_dir, Uploaded};
 pub use hnsw::{
     ArenaNodeStore, GraphNode, Hnsw, HnswArena, HnswIndex, HnswNaive, HnswNodeStore,
     HnswVectorStore, NaiveNodeStore, NodeBlock, NodeId, DEFAULT_ALIGNMENT,

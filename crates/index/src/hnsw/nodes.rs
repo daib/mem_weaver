@@ -209,16 +209,20 @@ impl Node {
 enum NodeBlockStorage {
     InMemory(Arena),
     OnDisk(File),
+    /// No local copy: the bytes were evicted via [`NodeBlock::evict`] and live only in
+    /// remote storage (e.g. uploaded to S3). Reads (`vector_at`, `neighbors_at`) will
+    /// panic until [`NodeBlock::swap_in_from`] restores the block from a path.
+    Evicted,
 }
 
 impl NodeBlockStorage {
-    /// Base pointer of the in-memory mapping. Returns `null` when the storage is on disk
-    /// (callers must `swap_in()` before reads).
+    /// Base pointer of the in-memory mapping. Returns `null` for non-memory variants
+    /// (callers must `swap_in()` / `swap_in_from()` before reads).
     #[inline]
     fn as_ptr(&self) -> *const u8 {
         match self {
             NodeBlockStorage::InMemory(a) => a.as_ptr(),
-            NodeBlockStorage::OnDisk(_) => std::ptr::null(),
+            NodeBlockStorage::OnDisk(_) | NodeBlockStorage::Evicted => std::ptr::null(),
         }
     }
 }
@@ -264,6 +268,13 @@ impl NodeBlock {
         matches!(self.storage, NodeBlockStorage::OnDisk(_))
     }
 
+    /// `true` when the block has been [`NodeBlock::evict`]ed — no local arena, no
+    /// open fd. Reads panic; [`NodeBlock::swap_in_from`] must restore it from a path.
+    #[inline]
+    pub fn is_evicted(&self) -> bool {
+        matches!(self.storage, NodeBlockStorage::Evicted)
+    }
+
     #[inline]
     fn calculate_node_id(&mut self, offset: usize) -> NodeId {
         // assume that we align to 8 bytes
@@ -286,10 +297,11 @@ impl NodeBlock {
     // return the index of the new node in the block
     pub fn push_node(&mut self, vector: &[f32], max_level: usize) -> Option<NodeId> {
         let total = Node::total_size(self.dim, max_level, self.m, self.m_max0);
-        // Only the in-memory variant supports allocations; swapped-out blocks are sealed.
+        // Only the in-memory variant supports allocations; swapped-out / evicted blocks
+        // are sealed.
         let arena = match &mut self.storage {
             NodeBlockStorage::InMemory(a) => a,
-            NodeBlockStorage::OnDisk(_) => return None,
+            NodeBlockStorage::OnDisk(_) | NodeBlockStorage::Evicted => return None,
         };
         // we need to align by 8 bytes at the moment
         let node_storage = arena.try_alloc_slice_aligned::<u8>(total, DEFAULT_ALIGNMENT)?;
@@ -318,6 +330,9 @@ impl NodeBlock {
     /// byte offset into `buf` and return a slice borrowed from `buf`.
     pub fn vector_at<'a>(&'a self, node_id: NodeId, buf: &'a mut Vec<u8>) -> &'a [f32] {
         match &self.storage {
+            NodeBlockStorage::Evicted => {
+                panic!("vector_at on an evicted NodeBlock; call swap_in_from(path) first")
+            }
             NodeBlockStorage::InMemory(_) => {
                 let node_address = self.calculate_node_address(node_id);
                 // SAFETY: arena pointer is valid for the node's full extent; vector starts
@@ -347,6 +362,9 @@ impl NodeBlock {
     pub fn neighbors_at(&self, node_id: NodeId, level: usize, buf: &mut Vec<u8>) -> &[NodeId] {
         assert!(level < LEVELS);
         match &self.storage {
+            NodeBlockStorage::Evicted => {
+                panic!("neighbors_at on an evicted NodeBlock; call swap_in_from(path) first")
+            }
             NodeBlockStorage::InMemory(_) => {
                 let node_address = self.calculate_node_address(node_id);
                 unsafe { Node::edges_at_level(node_address, self.dim, level, self.m, self.m_max0) }
@@ -400,9 +418,51 @@ impl NodeBlock {
                     "node block is already swapped out",
                 ));
             }
+            NodeBlockStorage::Evicted => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "cannot swap_out an evicted node block; restore via swap_in_from first",
+                ));
+            }
         };
         // Assignment drops the previous storage (and the in-memory mmap inside it).
         self.storage = NodeBlockStorage::OnDisk(new_file);
+        Ok(())
+    }
+
+    /// Drop the block's local backing (arena bytes or open fd) without touching any
+    /// local file that may exist on disk. After this returns, [`is_evicted`] is `true`
+    /// and read APIs (`vector_at`, `neighbors_at`) will panic until the block is
+    /// restored via [`swap_in_from`].
+    ///
+    /// Use case: after `swap_out` followed by an upload to blob storage, call `evict`
+    /// to close the fd so the caller can `std::fs::remove_file` the local copy and
+    /// fully reclaim disk space — the block now lives only in remote storage.
+    pub fn evict(&mut self) {
+        self.storage = NodeBlockStorage::Evicted;
+    }
+
+    /// Open `path`, read its entire contents into a fresh anonymous arena, and transition
+    /// to [`NodeBlockStorage::InMemory`]. Works from any current state — replaces the
+    /// existing arena or closes the existing fd before opening `path`.
+    ///
+    /// Inverse of [`swap_out`] but accepts an arbitrary path, so the bytes can come from
+    /// somewhere other than the original swap-out target (e.g. a fresh download from
+    /// blob storage). The block's `len` (node count) and `block_index` are preserved.
+    pub fn swap_in_from(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        let mut file = OpenOptions::new().read(true).open(path.as_ref())?;
+        let len = file.metadata()?.len() as usize;
+        let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
+        // SAFETY: anonymous mmap is at least `mapped_bytes() >= len` bytes; we treat
+        // the first `len` bytes as the destination buffer for the file contents.
+        let dest: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena.mapped_bytes())
+        };
+        file.read_exact(&mut dest[..len])?;
+        // Seal the arena so future push_node calls return None.
+        let cap = arena.capacity_bytes();
+        let _ = arena.try_alloc_slice_aligned::<u8>(cap, 1);
+        self.storage = NodeBlockStorage::InMemory(arena);
         Ok(())
     }
 
@@ -432,6 +492,12 @@ impl NodeBlock {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     "node block is already in memory",
+                ));
+            }
+            NodeBlockStorage::Evicted => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "node block is evicted; use swap_in_from(path) to restore from a file",
                 ));
             }
         };
@@ -530,6 +596,40 @@ impl ArenaNodeStore {
         Ok(restored)
     }
 
+    /// Drop the local backing (arena or fd) of every block. Already-evicted blocks
+    /// are skipped. Returns the number of blocks that transitioned to evicted.
+    ///
+    /// Callers usually pair this with `std::fs::remove_dir_all(dir)` after a successful
+    /// upload to free disk; the block can later be brought back with [`swap_in_from`].
+    pub fn evict(&mut self) -> usize {
+        let mut evicted = 0;
+        for block in &mut self.blocks {
+            if block.is_evicted() {
+                continue;
+            }
+            block.evict();
+            evicted += 1;
+        }
+        evicted
+    }
+
+    /// Restore every non-in-memory block by reading `dir/block_<block_index>.arena`.
+    /// Files must exist for every evicted/on-disk block; missing files surface as I/O errors.
+    /// Already-in-memory blocks are skipped. Returns the number of blocks restored.
+    pub fn swap_in_from(&mut self, dir: impl AsRef<Path>) -> io::Result<usize> {
+        let dir = dir.as_ref();
+        let mut restored = 0;
+        for block in &mut self.blocks {
+            if block.is_in_memory() {
+                continue;
+            }
+            let path = dir.join(format!("block_{}.arena", block.block_index));
+            block.swap_in_from(&path)?;
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     /// `true` if every block is currently swapped to disk.
     pub fn all_on_disk(&self) -> bool {
         !self.blocks.is_empty() && self.blocks.iter().all(|b| b.is_on_disk())
@@ -538,6 +638,11 @@ impl ArenaNodeStore {
     /// `true` if every block is currently in memory.
     pub fn all_in_memory(&self) -> bool {
         self.blocks.iter().all(|b| b.is_in_memory())
+    }
+
+    /// `true` if every block is currently evicted (no local copy).
+    pub fn all_evicted(&self) -> bool {
+        !self.blocks.is_empty() && self.blocks.iter().all(|b| b.is_evicted())
     }
 
     #[inline]
@@ -623,6 +728,15 @@ pub trait HnswNodeStore {
     }
     /// Restore on-disk storage units to memory. Default: no-op.
     fn swap_in(&mut self) -> io::Result<usize> {
+        Ok(0)
+    }
+    /// Drop local backing (arena bytes or open fd) for every storage unit; bytes must
+    /// be restored via [`Self::swap_in_from`] before the next read. Default: no-op.
+    fn evict(&mut self) -> usize {
+        0
+    }
+    /// Restore every storage unit by reading `dir/block_<i>.arena`. Default: no-op.
+    fn swap_in_from(&mut self, _dir: &Path) -> io::Result<usize> {
         Ok(0)
     }
 }
@@ -880,6 +994,14 @@ impl HnswNodeStore for ArenaNodeStore {
 
     fn swap_in(&mut self) -> io::Result<usize> {
         ArenaNodeStore::swap_in(self)
+    }
+
+    fn evict(&mut self) -> usize {
+        ArenaNodeStore::evict(self)
+    }
+
+    fn swap_in_from(&mut self, dir: &Path) -> io::Result<usize> {
+        ArenaNodeStore::swap_in_from(self, dir)
     }
 }
 #[cfg(test)]

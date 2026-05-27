@@ -7,6 +7,8 @@ pub mod data_loading;
 pub mod distance;
 pub mod eval;
 pub mod memory_usage;
+#[cfg(feature = "s3")]
+pub mod s3;
 pub mod types;
 
 pub use algorithms::{top_k_heap, top_k_quickselect, top_k_sort, OrdF32};

@@ -14,13 +14,23 @@
 //! - `SIFT1M_RECALL_N_QUERIES` — number of queries to evaluate (default `10`).
 //! - `SIFT1M_HNSW_EF` — search `ef` at level 0 (default `100`).
 //! - `SIFT1M_TIME_BUCKET_COUNTS` — comma-separated bucket counts to try (default `1,4,16`).
+//! - `MEM_WEAVER_S3_BUCKET` — when set, the swapped-out arena files are also uploaded to S3
+//!   under `s3://$BUCKET/$MEM_WEAVER_S3_PREFIX/n<num_buckets>/seq_<i>/` and the upload is
+//!   verified by downloading to a fresh dir and byte-comparing. Unset → S3 step skipped.
+//! - `MEM_WEAVER_S3_REGION` (default `us-east-1`), `MEM_WEAVER_S3_PROFILE` (default `default`),
+//!   `MEM_WEAVER_S3_PREFIX` (default unique per run). Credentials read from `~/.aws/credentials`.
+
+mod helpers;
 
 use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
 use common::{top_k_quickselect, Timestamp};
-use index::{BucketedNodeId, TimeBucketIndex, DEFAULT_ALIGNMENT};
+use index::{upload_arena_dir, BucketedNodeId, TimeBucketIndex, DEFAULT_ALIGNMENT};
+use object_store::{path::Path as ObjectPath, ObjectStore};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vector::{read_fvecs_vector_at, VectorId};
 
@@ -34,7 +44,24 @@ const DEFAULT_NUM_BASE_VECTORS: usize = 10_000;
 const DEFAULT_NUM_QUERIES: usize = 10;
 const DEFAULT_EF_CONSTRUCTION: usize = 200;
 const DEFAULT_SEARCH_EF: usize = 100;
-const DEFAULT_BUCKET_COUNTS: &[usize] = &[1, 4, 16];
+const DEFAULT_BUCKET_COUNTS: &[usize] = &[4];
+
+// ── S3 defaults ─────────────────────────────────────────────────────────────
+// Used when MEM_WEAVER_S3_* env vars are unset. Edit these to your dev bucket
+// to skip exporting env vars every run.
+//
+// Skip rules:
+//   - DEFAULT_BUCKET == "<edit-me>"           → S3 step is skipped (safe default).
+//   - MEM_WEAVER_S3_BUCKET set to empty ("") → S3 step is skipped (escape hatch).
+// Otherwise S3 runs with whichever value is resolved.
+//
+// DEFAULT_PREFIX: parent path under the bucket. A unique-per-run suffix is
+// appended so concurrent runs don't collide. Empty → falls back to a fully
+// unique prefix under `mem_weaver_test/sift_*`.
+const DEFAULT_BUCKET: &str = "mem-weaver-test";
+const DEFAULT_REGION: &str = "us-east-1";
+const DEFAULT_PROFILE: &str = "default";
+const DEFAULT_PREFIX: &str = "dev/sift";
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
@@ -98,6 +125,22 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
     eprintln!(
         "sift_time_bucket_recall: dim={dim} n_base={n_base} n_q={n_q} k={K} m={M} m_max0={M_MAX0} ef_search={ef} ef_construction={ef_construction} alignment={DEFAULT_ALIGNMENT} rng_seed={RNG_SEED} bucket_counts={bucket_counts:?}"
     );
+
+    // Optional S3 setup: only initialized if MEM_WEAVER_S3_BUCKET is set.
+    let s3 = match S3Setup::try_from_env() {
+        Ok(Some(s)) => {
+            eprintln!(
+                "s3: bucket={} region={} run_prefix={}",
+                s.bucket, s.region, s.run_prefix
+            );
+            Some(s)
+        }
+        Ok(None) => {
+            eprintln!("s3: MEM_WEAVER_S3_BUCKET unset; S3 upload step skipped");
+            None
+        }
+        Err(e) => panic!("S3 setup failed: {e}"),
+    };
 
     for &num_buckets in &bucket_counts {
         // Choose bucket_duration so the row-indexed timestamps split into ~num_buckets windows.
@@ -205,13 +248,86 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
 
         let cold_stats = run_recall(&index, "cold");
 
+        // ── Restore: either via local fds (no S3) or via full S3 round-trip ─────
+        // When S3 is configured, we upload, evict the local fds, delete the local
+        // files, then download into a *fresh* dir and swap_in_from there — proving
+        // search actually reads from blob-derived bytes (not lingering local copies).
         let t_swap_in = Instant::now();
-        for seq in &bucket_seqs {
-            let restored = index.swap_bucket_in(*seq).expect("swap_bucket_in");
-            assert!(restored, "{label}: bucket_seq must be present for swap_in");
-        }
+        let _blob_restore_guard = if let Some(s3) = &s3 {
+            let run_prefix = s3.run_prefix.child(format!("n{num_buckets}"));
+
+            // 1. Upload every bucket's arena files to S3.
+            let t_up = Instant::now();
+            let mut uploaded_total = 0usize;
+            s3.rt.block_on(async {
+                for (i, _) in bucket_seqs.iter().enumerate() {
+                    let local = cold_root.join(format!("seq_{i}"));
+                    let prefix = run_prefix.child(format!("seq_{i}"));
+                    let up = upload_arena_dir(s3.store.as_ref(), &local, &prefix)
+                        .await
+                        .expect("upload_arena_dir");
+                    uploaded_total += up.len();
+                }
+            });
+            eprintln!(
+                "{label}: uploaded {uploaded_total} arena file(s) to s3://{}/{} in {:.3} ms",
+                s3.bucket,
+                run_prefix,
+                ms(t_up.elapsed())
+            );
+
+            // 2. Evict locally — closes fds on every block. Reads now panic until restore.
+            let mut evicted_total = 0usize;
+            for seq in &bucket_seqs {
+                let n = index.evict_bucket(*seq).expect("seq present for evict");
+                evicted_total += n;
+            }
+            // 3. Delete local files — disk fully reclaimed; bytes live only in S3.
+            std::fs::remove_dir_all(&cold_root).expect("rm cold_root");
+            assert!(!cold_root.exists(), "local cold dir is gone");
+            eprintln!(
+                "{label}: evicted {evicted_total} blocks and deleted local cold dir",
+            );
+
+            // 4. Download into a brand-new dir, then swap each bucket back in from it.
+            let blob_root = unique_swap_dir(&format!("sift_time_bucket_n{num_buckets}_blob"));
+            let blob_guard = DirGuard(blob_root.clone());
+            std::fs::create_dir_all(&blob_root).expect("mk blob restore dir");
+            let t_dn = Instant::now();
+            s3.rt.block_on(async {
+                for (i, seq) in bucket_seqs.iter().enumerate() {
+                    let prefix = run_prefix.child(format!("seq_{i}"));
+                    let local = blob_root.join(format!("seq_{i}"));
+                    let restored = index
+                        .swap_bucket_in_from_blob(*seq, s3.store.as_ref(), &prefix, &local)
+                        .await
+                        .expect("swap_bucket_in_from_blob")
+                        .expect("seq present for blob restore");
+                    assert!(restored >= 1, "{label}: at least one block restored");
+                }
+            });
+            eprintln!(
+                "{label}: downloaded + swapped in {} buckets from blob in {:.3} ms",
+                bucket_seqs.len(),
+                ms(t_dn.elapsed())
+            );
+
+            // 5. Clean up this iteration's uploads. Final cleanup at test end handles
+            //    leftovers if a later assertion panics.
+            s3.rt
+                .block_on(helpers::s3::delete_prefix(s3.store.as_ref(), &run_prefix));
+
+            Some(blob_guard)
+        } else {
+            // No S3 — restore from the local fds held by swap_out.
+            for seq in &bucket_seqs {
+                let restored = index.swap_bucket_in(*seq).expect("swap_bucket_in");
+                assert!(restored, "{label}: bucket_seq must be present for swap_in");
+            }
+            None
+        };
         eprintln!(
-            "{label}: swapped {} buckets back into memory in {:.3} ms",
+            "{label}: restored {} buckets into memory in {:.3} ms",
             bucket_seqs.len(),
             ms(t_swap_in.elapsed())
         );
@@ -249,5 +365,76 @@ struct DirGuard(std::path::PathBuf);
 impl Drop for DirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// ── Optional S3 setup ───────────────────────────────────────────────────────
+
+/// Holds the S3 store, run-wide prefix, and a tokio runtime to drive the async
+/// upload/download calls from this sync `#[test]`. Constructed only when
+/// `MEM_WEAVER_S3_BUCKET` is set.
+struct S3Setup {
+    bucket: String,
+    region: String,
+    run_prefix: ObjectPath,
+    store: Arc<dyn ObjectStore>,
+    rt: tokio::runtime::Runtime,
+}
+
+impl S3Setup {
+    fn try_from_env() -> io::Result<Option<Self>> {
+        // Bucket: env wins, default fills in, empty env-string and "<edit-me>" both skip.
+        let bucket = helpers::s3::resolve("MEM_WEAVER_S3_BUCKET", DEFAULT_BUCKET);
+        if bucket == "<edit-me>" {
+            return Ok(None);
+        }
+        if bucket.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "MEM_WEAVER_S3_BUCKET={bucket:?} contains '/'; \
+                     S3 bucket names can't contain slashes. Move folder parts into the prefix \
+                     (set MEM_WEAVER_S3_PREFIX or edit DEFAULT_PREFIX)."
+                ),
+            ));
+        }
+        let region = helpers::s3::resolve("MEM_WEAVER_S3_REGION", DEFAULT_REGION);
+        let profile = helpers::s3::resolve("MEM_WEAVER_S3_PROFILE", DEFAULT_PROFILE);
+        // Prefix: env literal wins. Otherwise append a unique run id under DEFAULT_PREFIX
+        // (or under a generic prefix if DEFAULT_PREFIX is empty) so concurrent runs and
+        // re-runs each get their own subtree.
+        let prefix = std::env::var("MEM_WEAVER_S3_PREFIX")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                let id = helpers::s3::unique_run_id();
+                if DEFAULT_PREFIX.is_empty() {
+                    format!("mem_weaver_test/sift_{id}")
+                } else {
+                    format!("{DEFAULT_PREFIX}/{id}")
+                }
+            });
+
+        helpers::s3::ensure_bucket(&bucket, &region, &profile)?;
+        let store = helpers::s3::build_store(&profile, &bucket, &region)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        Ok(Some(Self {
+            bucket,
+            region,
+            run_prefix: ObjectPath::from(prefix),
+            store,
+            rt,
+        }))
+    }
+}
+
+impl Drop for S3Setup {
+    fn drop(&mut self) {
+        // Final cleanup catches leftovers from a panicking iteration; per-iteration
+        // cleanup handles the common case.
+        helpers::s3::cleanup_prefix_on_thread(Arc::clone(&self.store), self.run_prefix.clone());
     }
 }

@@ -5,10 +5,18 @@ edition = "2021"
 description = "Shared types for MemWeaver crates"
 publish = false
 
+[features]
+default = []
+# Opt-in S3 helpers (object_store + AWS credential file parser). Enable from
+# downstream crates with `common = { path = "../common", features = ["s3"] }`.
+s3 = ["dep:object_store", "dep:futures"]
+
 [dependencies]
 memmap2 = { workspace = true }
 thiserror = { workspace = true }
 wide = { workspace = true }
+object_store = { workspace = true, optional = true, features = ["aws"] }
+futures = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

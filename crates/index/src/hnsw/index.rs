@@ -22,6 +22,14 @@ pub trait HnswIndex {
     fn swap_out(&mut self, dir: &std::path::Path) -> std::io::Result<usize>;
     /// Restore on-disk storage units to memory. Returns the number restored.
     fn swap_in(&mut self) -> std::io::Result<usize>;
+    /// Drop the local backing for every storage unit (closes open fds and releases
+    /// arena memory). Bytes must be restored via [`Self::swap_in_from`] before the
+    /// next read. Returns the number of units transitioned to evicted.
+    fn evict(&mut self) -> usize;
+    /// Restore every storage unit by reading `dir/block_<i>.arena`. Inverse of
+    /// [`Self::swap_out`] but accepts arbitrary paths so the bytes can come from a
+    /// fresh download (e.g. blob storage). Returns the number of units restored.
+    fn swap_in_from(&mut self, dir: &std::path::Path) -> std::io::Result<usize>;
 }
 
 /// HNSW index: `N` holds the graph ([`NaiveNodeStore`] or [`ArenaNodeStore`](super::nodes::ArenaNodeStore)), `S` holds vectors.
@@ -109,6 +117,14 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
 
     fn swap_in(&mut self) -> std::io::Result<usize> {
         self.graph.swap_in()
+    }
+
+    fn evict(&mut self) -> usize {
+        self.graph.evict()
+    }
+
+    fn swap_in_from(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
+        self.graph.swap_in_from(dir)
     }
 }
 

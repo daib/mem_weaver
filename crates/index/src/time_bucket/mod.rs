@@ -356,6 +356,89 @@ impl TimeBucketIndex {
         bucket.index.swap_in()?;
         Ok(true)
     }
+
+    /// Drop the local backing (arena bytes or open fds) of the bucket identified by
+    /// `seq`. After this returns, the bucket has no in-memory or on-disk presence —
+    /// only the metadata (block count, dim, etc.) is preserved. Reads via
+    /// [`TimeBucketIndex::search`] across this bucket will panic until the bucket is
+    /// restored via [`TimeBucketIndex::swap_bucket_in_from`].
+    ///
+    /// Typical use: after [`TimeBucketIndex::swap_bucket_out_to_blob`], call this and
+    /// then `std::fs::remove_dir_all(local_dir)` to fully reclaim disk; the bucket now
+    /// lives only in remote storage and can be restored on demand.
+    ///
+    /// Returns `Some(num_storage_units_evicted)` if the bucket was found, `None` otherwise.
+    pub fn evict_bucket(&mut self, seq: BucketSeq) -> Option<usize> {
+        let bucket = self.buckets.iter_mut().find(|b| b.seq == seq)?;
+        Some(bucket.index.evict())
+    }
+
+    /// Restore the bucket identified by `seq` by reading each block file from `dir`.
+    /// Expects `dir/block_<i>.arena` to exist for every block (same layout
+    /// [`TimeBucketIndex::swap_bucket_out`] produced and [`crate::download_arena_dir`]
+    /// recreates on download).
+    ///
+    /// Returns `Ok(Some(num_restored))` on success, `Ok(None)` if the bucket isn't found.
+    pub fn swap_bucket_in_from(
+        &mut self,
+        seq: BucketSeq,
+        dir: &std::path::Path,
+    ) -> std::io::Result<Option<usize>> {
+        let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) else {
+            return Ok(None);
+        };
+        Ok(Some(bucket.index.swap_in_from(dir)?))
+    }
+
+    /// Download `<prefix>/block_*.arena` from `store` into `local_dir`, then restore the
+    /// bucket identified by `seq` by reading those files. Convenience wrapper around
+    /// [`crate::download_arena_dir`] + [`TimeBucketIndex::swap_bucket_in_from`].
+    ///
+    /// `local_dir` is created if missing. Returns `Ok(Some(num_restored))` if the bucket
+    /// was found, `Ok(None)` otherwise.
+    pub async fn swap_bucket_in_from_blob(
+        &mut self,
+        seq: BucketSeq,
+        store: &dyn object_store::ObjectStore,
+        prefix: &object_store::path::Path,
+        local_dir: &std::path::Path,
+    ) -> std::io::Result<Option<usize>> {
+        // Probe first: avoids an unnecessary download if the seq is unknown.
+        if !self.buckets.iter().any(|b| b.seq == seq) {
+            return Ok(None);
+        }
+        std::fs::create_dir_all(local_dir)?;
+        crate::blob::download_arena_dir(store, prefix, local_dir).await?;
+        self.swap_bucket_in_from(seq, local_dir)
+    }
+
+    /// Swap the bucket identified by `seq` to disk under `local_dir` and immediately
+    /// upload every produced `block_*.arena` file to `store` under `prefix`.
+    ///
+    /// Combines [`TimeBucketIndex::swap_bucket_out`] with [`crate::blob::upload_arena_dir`].
+    /// After this returns:
+    /// - The bucket stays in the index; search keeps working through the on-disk read path.
+    /// - Local files at `local_dir` remain on disk — the index's open file descriptors
+    ///   reference them, so `swap_bucket_in` can still restore the bucket. Delete them
+    ///   only after a successful `swap_bucket_in` or full eviction.
+    /// - Blobs live at `<prefix>/block_*.arena` in `store`.
+    ///
+    /// Returns `Ok(true)` if the bucket was found and processed, `Ok(false)` if no bucket
+    /// with `seq` exists. Errors from either swap_out or the upload are forwarded.
+    pub async fn swap_bucket_out_to_blob(
+        &mut self,
+        seq: BucketSeq,
+        local_dir: &std::path::Path,
+        store: &dyn object_store::ObjectStore,
+        prefix: &object_store::path::Path,
+    ) -> std::io::Result<bool> {
+        let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) else {
+            return Ok(false);
+        };
+        bucket.index.swap_out(local_dir)?;
+        crate::blob::upload_arena_dir(store, local_dir, prefix).await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -746,5 +829,165 @@ mod tests {
             .swap_bucket_out(seq, &root.join("seq_0"))
             .expect("second out (idempotent, no-op)"));
         assert!(idx.swap_bucket_in(seq).expect("swap_in still works"));
+    }
+
+    // ── swap_bucket_out_to_blob ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn swap_bucket_out_to_blob_uploads_all_block_files() {
+        use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+        use std::sync::Arc;
+
+        let root = unique_swap_dir("blob_upload");
+        let _guard = DirGuard(root.clone());
+
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0));
+        idx.insert(&[2.0; 4], ts(0));
+        let seq = BucketSeq(0);
+
+        let local = root.join("seq_0");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("dev/mem-weaver-test/buckets/seq_0");
+
+        let moved = idx
+            .swap_bucket_out_to_blob(seq, &local, store.as_ref(), &prefix)
+            .await
+            .expect("swap_bucket_out_to_blob");
+        assert!(moved, "bucket must be found and uploaded");
+
+        // Every local block_*.arena file must exist as <prefix>/<filename> in the store.
+        let local_files: Vec<_> = std::fs::read_dir(&local)
+            .expect("read_dir")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("arena")).then_some(p)
+            })
+            .collect();
+        assert!(!local_files.is_empty(), "swap_out produced at least one arena file");
+
+        for f in &local_files {
+            let name = f.file_name().unwrap().to_str().unwrap();
+            let got = store
+                .get(&prefix.child(name))
+                .await
+                .expect("get")
+                .bytes()
+                .await
+                .unwrap();
+            let want = std::fs::read(f).expect("local read");
+            assert_eq!(got.as_ref(), want.as_slice(), "{name} differs in blob");
+        }
+
+        // Bucket still indexed; swap back in to confirm we didn't leave it in a broken state.
+        assert!(idx.swap_bucket_in(seq).expect("swap_in"));
+    }
+
+    #[tokio::test]
+    async fn evict_then_swap_in_from_blob_restores_search_results() {
+        use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+        use std::sync::Arc;
+
+        let root = unique_swap_dir("evict_blob_rt");
+        let _guard = DirGuard(root.clone());
+
+        let mut idx = make_index(10);
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0));
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0));
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0));
+        let seq = BucketSeq(0);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(before.len(), 3, "baseline search returns all three");
+
+        // 1. Swap to local + upload to blob.
+        let local = root.join("seq_0");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("buckets/seq_0");
+        assert!(idx
+            .swap_bucket_out_to_blob(seq, &local, store.as_ref(), &prefix)
+            .await
+            .expect("swap_bucket_out_to_blob"));
+
+        // 2. Evict locally — fds closed, then delete the local dir to fully reclaim disk.
+        let evicted = idx.evict_bucket(seq).expect("bucket present");
+        assert!(evicted >= 1, "at least one block evicted");
+        std::fs::remove_dir_all(&local).expect("rm local");
+        assert!(!local.exists(), "local copy is gone");
+
+        // 3. Restore from blob into a *fresh* directory (proves the bytes really came
+        //    back from S3, not from any lingering local file).
+        let restored_dir = root.join("seq_0_restored");
+        let restored = idx
+            .swap_bucket_in_from_blob(seq, store.as_ref(), &prefix, &restored_dir)
+            .await
+            .expect("swap_bucket_in_from_blob")
+            .expect("bucket present");
+        assert_eq!(restored, evicted, "every evicted block restored");
+        assert!(restored_dir.exists(), "files materialized locally for swap_in");
+
+        // 4. Search must return identical results — search has been reading entirely
+        //    from blob-derived bytes since step 3.
+        let after = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(after, before, "search must match baseline after full S3 round-trip");
+    }
+
+    #[tokio::test]
+    async fn evict_bucket_unknown_seq_returns_none() {
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0));
+        assert!(idx.evict_bucket(BucketSeq(999)).is_none());
+    }
+
+    #[tokio::test]
+    async fn swap_bucket_in_from_blob_unknown_seq_returns_none_and_downloads_nothing() {
+        use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+        use std::sync::Arc;
+
+        let root = unique_swap_dir("in_from_blob_unknown");
+        let _guard = DirGuard(root.clone());
+
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0));
+
+        let local = root.join("seq_999");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("buckets/seq_999");
+
+        let res = idx
+            .swap_bucket_in_from_blob(BucketSeq(999), store.as_ref(), &prefix, &local)
+            .await
+            .expect("no IO when seq not found");
+        assert!(res.is_none());
+        assert!(!local.exists(), "no local dir created when bucket absent");
+    }
+
+    #[tokio::test]
+    async fn swap_bucket_out_to_blob_unknown_seq_returns_false_and_uploads_nothing() {
+        use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+        use std::sync::Arc;
+
+        let root = unique_swap_dir("blob_unknown");
+        let _guard = DirGuard(root.clone());
+
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0));
+
+        let local = root.join("seq_999");
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("dev/mem-weaver-test/buckets/seq_999");
+
+        let moved = idx
+            .swap_bucket_out_to_blob(BucketSeq(999), &local, store.as_ref(), &prefix)
+            .await
+            .expect("no IO when seq not found");
+        assert!(!moved);
+        assert!(!local.exists(), "no local files written when bucket absent");
+
+        // Store must be empty under prefix.
+        let mut list = store.list(Some(&prefix));
+        use futures::StreamExt;
+        assert!(list.next().await.is_none(), "no objects uploaded");
     }
 }

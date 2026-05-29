@@ -24,11 +24,13 @@ mod helpers;
 
 use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
 use common::{top_k_quickselect, Timestamp};
-use index::{upload_arena_dir, BucketedNodeId, TimeBucketIndex, DEFAULT_ALIGNMENT};
+use index::{
+    blob::{upload_levels, upload_manifest},
+    upload_arena_dir, TimeBucketIndex, DEFAULT_ALIGNMENT,
+};
 use object_store::{path::Path as ObjectPath, ObjectStore};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -160,15 +162,12 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         )
         .expect("valid TimeBucketIndex config");
 
-        // BucketedNodeId is (bucket_seq, NodeId) — neither is the corpus row index, so we
-        // build the map at insert time the same way sift1m_hnsw_recall does for NodeId.
-        let mut id_to_corpus: HashMap<BucketedNodeId, usize> = HashMap::with_capacity(n_base);
-
         let t_idx = Instant::now();
         let mut batch_start = Instant::now();
+        let mut seen_seqs = std::collections::HashSet::new();
         for (i, v) in corpus.iter().enumerate() {
-            let bid = index.insert(v.as_slice(), Timestamp(i as u64));
-            id_to_corpus.insert(bid, i);
+            let bid = index.insert(v.as_slice(), Timestamp(i as u64), i as u64);
+            seen_seqs.insert(bid.bucket_seq);
             if (i + 1) % 10_000 == 0 {
                 eprintln!(
                     "{label}: inserted [{}, {}) 10_000 vectors in {:.3} ms (cumulative build {:.3} ms)",
@@ -208,11 +207,8 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
                 sift_recall_stats(&phased_label, &corpus, q_data, dim, n_q, ef, |q| {
                     index
                         .search(q, K, ef, |_, d| d, None, top_k_quickselect)
-                        .iter()
-                        .map(|bid| {
-                            let corpus_row = id_to_corpus[bid];
-                            VectorId(corpus_row as u64)
-                        })
+                        .into_iter()
+                        .map(|bid| VectorId(bid.vector_id))
                         .collect()
                 });
             stats
@@ -225,15 +221,7 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         let _cold_guard = DirGuard(cold_root.clone());
         std::fs::create_dir_all(&cold_root).expect("mk cold dir");
 
-        let bucket_seqs: Vec<_> = {
-            use std::collections::HashSet;
-            id_to_corpus
-                .keys()
-                .map(|b| b.bucket_seq)
-                .collect::<HashSet<_>>()
-                .into_iter()
-                .collect()
-        };
+        let bucket_seqs: Vec<_> = seen_seqs.into_iter().collect();
         let t_swap_out = Instant::now();
         for (i, seq) in bucket_seqs.iter().enumerate() {
             let dir = cold_root.join(format!("seq_{i}"));
@@ -267,6 +255,12 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
                         .await
                         .expect("upload_arena_dir");
                     uploaded_total += up.len();
+                    upload_levels(s3.store.as_ref(), &local.join("levels.bin"), &prefix)
+                        .await
+                        .expect("upload_levels");
+                    upload_manifest(s3.store.as_ref(), &local.join("manifest.json"), &prefix)
+                        .await
+                        .expect("upload_manifest");
                 }
             });
             eprintln!(
@@ -285,9 +279,7 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
             // 3. Delete local files — disk fully reclaimed; bytes live only in S3.
             std::fs::remove_dir_all(&cold_root).expect("rm cold_root");
             assert!(!cold_root.exists(), "local cold dir is gone");
-            eprintln!(
-                "{label}: evicted {evicted_total} blocks and deleted local cold dir",
-            );
+            eprintln!("{label}: evicted {evicted_total} blocks and deleted local cold dir",);
 
             // 4. Download into a brand-new dir, then swap each bucket back in from it.
             let blob_root = unique_swap_dir(&format!("sift_time_bucket_n{num_buckets}_blob"));

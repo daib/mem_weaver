@@ -15,6 +15,8 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
 
 const ARENA_EXT: &str = "arena";
+const LEVELS_FILE: &str = "levels.bin";
+const MANIFEST_FILE: &str = "manifest.json";
 
 /// Result of a single block upload: the source path and the destination object path.
 #[derive(Debug, Clone)]
@@ -90,6 +92,50 @@ pub async fn download_arena_dir(
         out.push(res?);
     }
     Ok(out)
+}
+
+/// Upload a local `levels.bin` file to `<prefix>/levels.bin` in `store`.
+pub async fn upload_levels(
+    store: &dyn ObjectStore,
+    local: &Path,
+    prefix: &ObjectPath,
+) -> io::Result<Uploaded> {
+    let remote = prefix.child(LEVELS_FILE);
+    upload_one(store, local.to_owned(), remote).await
+}
+
+/// Download `<prefix>/levels.bin` from `store` to `local`.
+pub async fn download_levels(
+    store: &dyn ObjectStore,
+    prefix: &ObjectPath,
+    local: &Path,
+) -> io::Result<()> {
+    let remote = prefix.child(LEVELS_FILE);
+    download_one(store, remote, local.to_owned())
+        .await
+        .map(|_| ())
+}
+
+/// Upload a local `manifest.json` file to `<prefix>/manifest.json` in `store`.
+pub async fn upload_manifest(
+    store: &dyn ObjectStore,
+    local: &Path,
+    prefix: &ObjectPath,
+) -> io::Result<Uploaded> {
+    let remote = prefix.child(MANIFEST_FILE);
+    upload_one(store, local.to_owned(), remote).await
+}
+
+/// Download `<prefix>/manifest.json` from `store` to `local`.
+pub async fn download_manifest(
+    store: &dyn ObjectStore,
+    prefix: &ObjectPath,
+    local: &Path,
+) -> io::Result<()> {
+    let remote = prefix.child(MANIFEST_FILE);
+    download_one(store, remote, local.to_owned())
+        .await
+        .map(|_| ())
 }
 
 async fn upload_one(
@@ -184,7 +230,11 @@ mod tests {
         let uploaded = upload_arena_dir(store.as_ref(), &src, &prefix)
             .await
             .expect("upload");
-        assert_eq!(uploaded.len(), 2, "two arena files expected, README skipped");
+        assert_eq!(
+            uploaded.len(),
+            2,
+            "two arena files expected, README skipped"
+        );
 
         let restored = download_arena_dir(store.as_ref(), &prefix, &dst)
             .await
@@ -214,6 +264,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_download_levels_roundtrip() {
+        use crate::HnswNaive;
+        use common::top_k_quickselect;
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let local = temp_dir("levels");
+        let _g = DirGuard(local.clone());
+
+        let mut idx = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, StdRng::seed_from_u64(3));
+        for i in 0..10 {
+            idx.insert(&[i as f32, 0.0, 0.0, 0.0], i as u64);
+        }
+        let levels_path = local.join("levels.bin");
+        idx.save_levels(&levels_path).expect("save_levels");
+
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("hnsw/run-1");
+
+        upload_levels(store.as_ref(), &levels_path, &prefix)
+            .await
+            .expect("upload");
+
+        let dst = temp_dir("levels_dst");
+        let _g2 = DirGuard(dst.clone());
+        let restored = dst.join("levels.bin");
+        download_levels(store.as_ref(), &prefix, &restored)
+            .await
+            .expect("download");
+
+        let mut idx2 = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, StdRng::seed_from_u64(0));
+        idx2.load_levels(&restored).expect("load_levels");
+        assert_eq!(idx.node_ids, idx2.node_ids);
+        assert_eq!(idx.levels, idx2.levels);
+    }
+
+    #[tokio::test]
     async fn upload_after_swap_out_pushes_real_arena_files() {
         use crate::{HnswArena, HnswIndex};
         use common::top_k_quickselect;
@@ -222,18 +308,10 @@ mod tests {
         let local = temp_dir("hnsw_swap");
         let _g = DirGuard(local.clone());
 
-        let mut idx = HnswArena::new(
-            4,
-            4,
-            8,
-            32,
-            32,
-            top_k_quickselect,
-            StdRng::seed_from_u64(7),
-        );
+        let mut idx = HnswArena::new(4, 4, 8, 32, 32, top_k_quickselect, StdRng::seed_from_u64(7));
         for i in 0..16 {
             let v = [i as f32, 0.0, 0.0, 0.0];
-            idx.insert(&v);
+            idx.insert(&v, i as u64);
         }
         let moved = idx.swap_out(&local).expect("swap_out");
         assert!(moved >= 1, "at least one block must have been written");
@@ -251,7 +329,13 @@ mod tests {
 
         for u in &uploaded {
             // remote path is <prefix>/<filename>
-            let got = store.get(&u.remote).await.expect("get").bytes().await.unwrap();
+            let got = store
+                .get(&u.remote)
+                .await
+                .expect("get")
+                .bytes()
+                .await
+                .unwrap();
             let want = std::fs::read(&u.local).expect("local read");
             assert_eq!(got.as_ref(), want.as_slice(), "round-trip bytes mismatch");
         }

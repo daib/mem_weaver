@@ -25,8 +25,8 @@ pub fn builder_from_profile(
     bucket: &str,
     region: &str,
 ) -> io::Result<AmazonS3Builder> {
-    let home = std::env::var("HOME")
-        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME unset"))?;
+    let home =
+        std::env::var("HOME").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME unset"))?;
     let creds_path = format!("{home}/.aws/credentials");
     let body = std::fs::read_to_string(&creds_path)?;
 
@@ -77,11 +77,7 @@ pub fn builder_from_profile(
 }
 
 /// One-shot: [`builder_from_profile`] + `.build()` + `Arc::new`.
-pub fn build_store(
-    profile: &str,
-    bucket: &str,
-    region: &str,
-) -> io::Result<Arc<dyn ObjectStore>> {
+pub fn build_store(profile: &str, bucket: &str, region: &str) -> io::Result<Arc<dyn ObjectStore>> {
     let b = builder_from_profile(profile, bucket, region)?;
     Ok(Arc::new(
         b.build()

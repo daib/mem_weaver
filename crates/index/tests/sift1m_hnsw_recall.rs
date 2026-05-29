@@ -11,10 +11,9 @@
 
 use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
 use common::top_k_quickselect;
-use index::{HnswArena, HnswIndex, HnswNaive, NodeId, DEFAULT_ALIGNMENT};
+use index::{HnswArena, HnswIndex, HnswNaive, DEFAULT_ALIGNMENT};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use vector::{read_fvecs_vector_at, VectorId};
 
@@ -116,15 +115,10 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
         let label = test_case.label;
         let mut index = test_case.index;
 
-        // Ground truth uses corpus row indices as VectorId. Arena [`NodeId`]s are block-encoded,
-        // not 0..n-1 — map each insert's returned id → corpus index for recall comparison.
-        let mut graph_id_to_corpus: HashMap<NodeId, usize> = HashMap::with_capacity(n_base);
-
         let t_idx = Instant::now();
         let mut batch_start = Instant::now();
         for (i, v) in corpus.iter().enumerate() {
-            let nid = index.insert(v.as_slice());
-            graph_id_to_corpus.insert(nid, i);
+            index.insert(v.as_slice(), i as u64);
             if (i + 1) % 10_000 == 0 {
                 eprintln!(
                     "{label}: inserted [{}, {}) 10_000 vectors in {:.3} ms (cumulative build {:.3} ms)",
@@ -158,11 +152,8 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
         let (stats, _, _) = sift_recall_stats(label, &corpus, q_data, dim, n_q, ef, |q| {
             index
                 .search(q, K, ef)
-                .iter()
-                .map(|(nid, _)| {
-                    let corpus_row = graph_id_to_corpus[nid];
-                    VectorId(corpus_row as u64)
-                })
+                .into_iter()
+                .map(|(vid, _)| VectorId(vid))
                 .collect()
         });
         assert!(

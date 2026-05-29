@@ -1,8 +1,13 @@
 //! Shared HNSW graph and search over [`super::store::HnswVectorStore`] and [`super::nodes::HnswNodeStore`].
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufWriter, Read, Write};
+use std::path::Path;
+
+use crc32fast::Hasher as Crc32Hasher;
 
 use common::OrdF32;
 use rand::rngs::StdRng;
@@ -14,8 +19,8 @@ use super::nodes::{ArenaNodeStore, HnswNodeStore, NaiveNodeStore, NodeId, INVALI
 /// [`HnswNaive`] / [`HnswArena`] can be used as `dyn HnswIndex`.
 pub trait HnswIndex {
     fn len(&self) -> usize;
-    fn insert(&mut self, vector: &[f32]) -> NodeId;
-    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)>;
+    fn insert(&mut self, vector: &[f32], vector_id: u64) -> NodeId;
+    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)>;
     /// Move the index's hot data to disk under `dir`. Returns the number of underlying
     /// storage units (e.g. arena node blocks) that transitioned to on-disk state.
     /// No-op for indexes without arena-backed storage (e.g. naive heap).
@@ -30,6 +35,16 @@ pub trait HnswIndex {
     /// [`Self::swap_out`] but accepts arbitrary paths so the bytes can come from a
     /// fresh download (e.g. blob storage). Returns the number of units restored.
     fn swap_in_from(&mut self, dir: &std::path::Path) -> std::io::Result<usize>;
+    /// Serialize `node_ids` and `levels` to `path`. See [`Hnsw::save_levels`].
+    fn save_levels(&self, path: &std::path::Path) -> std::io::Result<()>;
+    /// Deserialize `node_ids` and `levels` from `path`. See [`Hnsw::load_levels`].
+    fn load_levels(&mut self, path: &std::path::Path) -> std::io::Result<()>;
+    /// Write a manifest capturing entry point, max layer, and arena file names.
+    fn save_manifest(&self, path: &std::path::Path) -> std::io::Result<()>;
+    /// Restore entry point and max layer from a manifest written by [`save_manifest`].
+    fn load_manifest(&mut self, path: &std::path::Path) -> std::io::Result<()>;
+    /// Drop the in-memory `node_ids` and `levels` buffers after they have been persisted.
+    fn clear_level_data(&mut self);
 }
 
 /// HNSW index: `N` holds the graph ([`NaiveNodeStore`] or [`ArenaNodeStore`](super::nodes::ArenaNodeStore)), `S` holds vectors.
@@ -46,6 +61,10 @@ pub struct Hnsw<N: HnswNodeStore> {
     graph: N,
     closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
     rng: StdRng,
+    pub node_ids: Vec<NodeId>,
+    pub vector_ids: Vec<u64>,
+    pub levels: Vec<u8>,
+    node_to_vector_id: HashMap<u32, u64>,
 }
 
 impl<N: HnswNodeStore> fmt::Debug for Hnsw<N>
@@ -93,6 +112,10 @@ impl Hnsw<NaiveNodeStore> {
             graph: NaiveNodeStore::new(m, m_max0),
             closest_m_candidates,
             rng,
+            node_ids: Vec::new(),
+            vector_ids: Vec::new(),
+            levels: Vec::new(),
+            node_to_vector_id: HashMap::new(),
         }
     }
 }
@@ -102,12 +125,12 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
         Hnsw::len(self)
     }
 
-    fn insert(&mut self, vector: &[f32]) -> NodeId {
+    fn insert(&mut self, vector: &[f32], vector_id: u64) -> NodeId {
         // Call inherent `Hnsw::insert`, not this trait method (same name would recurse).
-        Hnsw::insert(self, vector)
+        Hnsw::insert(self, vector, vector_id)
     }
 
-    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)> {
+    fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         Hnsw::search(self, query, k, ef)
     }
 
@@ -125,6 +148,26 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
 
     fn swap_in_from(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
         self.graph.swap_in_from(dir)
+    }
+
+    fn save_levels(&self, path: &std::path::Path) -> std::io::Result<()> {
+        Hnsw::save_levels(self, path)
+    }
+
+    fn load_levels(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        Hnsw::load_levels(self, path)
+    }
+
+    fn save_manifest(&self, path: &std::path::Path) -> std::io::Result<()> {
+        Hnsw::save_manifest(self, path)
+    }
+
+    fn load_manifest(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        Hnsw::load_manifest(self, path)
+    }
+
+    fn clear_level_data(&mut self) {
+        Hnsw::clear_level_data(self)
     }
 }
 
@@ -167,6 +210,10 @@ impl Hnsw<ArenaNodeStore> {
             graph,
             closest_m_candidates,
             rng,
+            node_ids: Vec::new(),
+            vector_ids: Vec::new(),
+            levels: Vec::new(),
+            node_to_vector_id: HashMap::new(),
         }
     }
 }
@@ -208,8 +255,8 @@ impl<N: HnswNodeStore> Hnsw<N> {
         level.min(32) as usize
     }
 
-    /// Insert a vector; returns internal id (`0 .. self.len()-1` after insert).
-    pub fn insert(&mut self, vector: &[f32]) -> NodeId {
+    /// Insert a vector with its external application id; returns the internal [`NodeId`].
+    pub fn insert(&mut self, vector: &[f32], vector_id: u64) -> NodeId {
         assert_eq!(
             vector.len(),
             self.dim,
@@ -225,6 +272,10 @@ impl<N: HnswNodeStore> Hnsw<N> {
             .graph
             .push_node(vector, level)
             .expect("node graph chunk allocation failed (mmap / OOM)");
+        self.node_ids.push(new_id);
+        self.vector_ids.push(vector_id);
+        self.levels.push(level as u8);
+        self.node_to_vector_id.insert(new_id.0, vector_id);
 
         // Store the entry point, e.g., the first point to search
         if self.entry_point.is_none() {
@@ -275,7 +326,7 @@ impl<N: HnswNodeStore> Hnsw<N> {
 
     /// k-NN search: returns up to `k` pairs `(internal_id, distance_sq)` sorted by distance.
     /// `ef` is the dynamic list size at level 0 (must be ≥ `k`).
-    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(NodeId, f32)> {
+    pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         assert_eq!(query.len(), self.dim);
         assert!(k > 0);
         let ef = ef.max(k);
@@ -296,6 +347,12 @@ impl<N: HnswNodeStore> Hnsw<N> {
         cands.sort_by(|a, b| a.1.total_cmp(&b.1));
         cands.truncate(k);
         cands
+            .into_iter()
+            .map(|(node_id, dist)| {
+                let vid = self.node_to_vector_id[&node_id.0];
+                (vid, dist)
+            })
+            .collect()
     }
 
     fn greedy_closest(&self, q: &[f32], mut best: NodeId, level: usize) -> NodeId {
@@ -369,6 +426,178 @@ impl<N: HnswNodeStore> Hnsw<N> {
         w.into_iter().map(|(d, i)| (i, d.inner())).collect()
     }
 
+    /// Write `node_ids` and `levels` to `path`.
+    ///
+    /// Layout (all little-endian):
+    /// ```text
+    /// version    : u32
+    /// count      : u64
+    /// node_ids   : [u32; count]
+    /// vector_ids : [u64; count]
+    /// levels     : [u8;  count]
+    /// crc32      : u32            — CRC32 of all preceding bytes
+    /// ```
+    pub fn save_levels(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        const VERSION: u32 = 2;
+        let count = self.node_ids.len() as u64;
+        let mut hasher = Crc32Hasher::new();
+        let mut w = BufWriter::new(
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?,
+        );
+        let mut write = |bytes: &[u8]| -> io::Result<()> {
+            hasher.update(bytes);
+            w.write_all(bytes)
+        };
+        write(&VERSION.to_le_bytes())?;
+        write(&count.to_le_bytes())?;
+        for id in &self.node_ids {
+            write(&id.0.to_le_bytes())?;
+        }
+        for vid in &self.vector_ids {
+            write(&vid.to_le_bytes())?;
+        }
+        write(&self.levels)?;
+        w.write_all(&hasher.finalize().to_le_bytes())?;
+        w.flush()
+    }
+
+    /// Read `node_ids`, `levels`, and `vector_ids` from a file written by [`save_levels`].
+    /// Replaces the current contents of all three lists.
+    pub fn load_levels(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        const EXPECTED_VERSION: u32 = 2;
+        let mut f = File::open(path)?;
+        let file_len = f.metadata()?.len() as usize;
+        if file_len < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "levels file too small",
+            ));
+        }
+        let mut data = vec![0u8; file_len - 4];
+        f.read_exact(&mut data)?;
+        let mut crc_buf = [0u8; 4];
+        f.read_exact(&mut crc_buf)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&data);
+        let computed_crc = hasher.finalize();
+        if computed_crc != stored_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "levels CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"
+                ),
+            ));
+        }
+        let mut pos = 0;
+        let version = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if version != EXPECTED_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported levels file version {version}"),
+            ));
+        }
+        let count = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()) as usize;
+        pos += 8;
+        let mut node_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            node_ids.push(NodeId(u32::from_le_bytes(
+                data[pos..pos + 4].try_into().unwrap(),
+            )));
+            pos += 4;
+        }
+        let mut vector_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            vector_ids.push(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()));
+            pos += 8;
+        }
+        let levels = data[pos..pos + count].to_vec();
+        pos += count;
+        let mut node_to_vector_id = HashMap::with_capacity(count);
+        for (nid, &vid) in node_ids.iter().zip(vector_ids.iter()) {
+            node_to_vector_id.insert(nid.0, vid);
+        }
+        self.node_ids = node_ids;
+        self.vector_ids = vector_ids;
+        self.levels = levels;
+        self.node_to_vector_id = node_to_vector_id;
+        Ok(())
+    }
+
+    /// Drop the in-memory `node_ids` and `levels` buffers, reclaiming their heap.
+    /// Called after both have been persisted to disk by [`save_levels`].
+    pub fn clear_level_data(&mut self) {
+        self.node_ids = Vec::new();
+        self.vector_ids = Vec::new();
+        self.levels = Vec::new();
+        // node_to_vector_id is intentionally kept: needed for search after swap-out
+    }
+
+    /// Write a manifest for this index to `path` as JSON.
+    ///
+    /// ```json
+    /// {
+    ///   "version": 1,
+    ///   "entry_point": 7,
+    ///   "max_layer": 2,
+    ///   "arena_files": ["block_0.arena", "block_1.arena"]
+    /// }
+    /// ```
+    /// `entry_point` is `null` when the index is empty.
+    pub fn save_manifest(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        #[derive(serde::Serialize)]
+        struct Manifest {
+            version: u32,
+            entry_point: Option<u32>,
+            max_layer: i32,
+            arena_files: Vec<String>,
+        }
+        let m = Manifest {
+            version: 1,
+            entry_point: self.entry_point.map(|id| id.0),
+            max_layer: self.max_depth,
+            arena_files: self.graph.arena_file_names(),
+        };
+        let json = serde_json::to_string_pretty(&m)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        f.write_all(json.as_bytes())?;
+        f.flush()
+    }
+
+    /// Restore entry point and max layer from a manifest written by [`save_manifest`].
+    pub fn load_manifest(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            version: u32,
+            entry_point: Option<u32>,
+            max_layer: i32,
+            #[allow(dead_code)]
+            arena_files: Vec<String>,
+        }
+        let text = std::fs::read_to_string(path)?;
+        let m: Manifest = serde_json::from_str(&text)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if m.version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported manifest version {}", m.version),
+            ));
+        }
+        self.entry_point = m.entry_point.map(NodeId);
+        self.max_depth = m.max_layer;
+        Ok(())
+    }
+
     // connect the node to the neighbors at the given level
     fn update_neighbors(&mut self, nid: NodeId, neighbors: &[NodeId], level: usize) {
         let graph = &mut self.graph;
@@ -415,26 +644,27 @@ mod tests {
             let v: Vec<f32> = (0..dim)
                 .map(|j| ((i * dim + j) as f32 * 0.03).sin())
                 .collect();
-            index.insert(v.as_slice());
+            index.insert(v.as_slice(), i as u64);
         }
 
         let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.1).cos()).collect();
 
         let mut buf: Vec<u8> = Vec::new();
-        let mut brute: Vec<(NodeId, f32)> = (0..n)
+        // Naive NodeId == insertion index, so vector_id == i as u64.
+        let mut brute: Vec<(u64, f32)> = (0..n)
             .map(|i| {
                 let id = NodeId(i as u32);
                 (
-                    id,
+                    i as u64,
                     euclidean_distance_sq(&query, index.vector_at(id, &mut buf)),
                 )
             })
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let gt: Vec<NodeId> = brute.iter().take(10).map(|(i, _)| *i).collect();
+        let gt: Vec<u64> = brute.iter().take(10).map(|(i, _)| *i).collect();
 
         let got = index.search(&query, 10, 128);
-        let got_ids: Vec<NodeId> = got.iter().map(|(i, _)| *i).collect();
+        let got_ids: Vec<u64> = got.iter().map(|(i, _)| *i).collect();
 
         let hit = gt.iter().filter(|id| got_ids.contains(id)).count();
         let recall = hit as f32 / 10.0;
@@ -448,12 +678,12 @@ mod tests {
     fn hnsw_naive_first_insert_is_entry() {
         let rng = StdRng::seed_from_u64(1);
         let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, rng);
-        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice());
+        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice(), 0u64);
         assert_eq!(id, NodeId(0));
         assert_eq!(index.entry_point, Some(NodeId(0)));
         let r = index.search(&[1.0, 0.0, 0.0, 0.0], 1, 8);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].0, NodeId(0));
+        assert_eq!(r[0].0, 0u64);
     }
 
     #[test]
@@ -468,26 +698,28 @@ mod tests {
             let v: Vec<f32> = (0..dim)
                 .map(|j| ((i * dim + j) as f32 * 0.03).sin())
                 .collect();
-            inserted.push(index.insert(v.as_slice()));
+            inserted.push(index.insert(v.as_slice(), i as u64));
         }
 
         let query: Vec<f32> = (0..dim).map(|j| (j as f32 * 0.1).cos()).collect();
 
         let mut buf: Vec<u8> = Vec::new();
-        let mut brute: Vec<(NodeId, f32)> = inserted
+        // inserted[i] is the NodeId for vector_id i (we insert with i as u64).
+        let mut brute: Vec<(u64, f32)> = inserted
             .iter()
-            .map(|&id| {
+            .enumerate()
+            .map(|(i, &id)| {
                 (
-                    id,
+                    i as u64,
                     euclidean_distance_sq(&query, index.vector_at(id, &mut buf)),
                 )
             })
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1));
-        let gt: Vec<NodeId> = brute.iter().take(10).map(|(i, _)| *i).collect();
+        let gt: Vec<u64> = brute.iter().take(10).map(|(i, _)| *i).collect();
 
         let got = index.search(&query, 10, 128);
-        let got_ids: Vec<NodeId> = got.iter().map(|(i, _)| *i).collect();
+        let got_ids: Vec<u64> = got.iter().map(|(i, _)| *i).collect();
 
         let hit = gt.iter().filter(|id| got_ids.contains(id)).count();
         let recall = hit as f32 / 10.0;
@@ -501,12 +733,30 @@ mod tests {
     fn hnsw_arena_first_insert_is_entry() {
         let rng = StdRng::seed_from_u64(1);
         let mut index: HnswArena = HnswArena::new(4, 4, 8, 32, 32, top_k_quickselect, rng);
-        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice());
+        let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice(), 0u64);
         assert_eq!(id, NodeId(0));
         assert_eq!(index.entry_point, Some(NodeId(0)));
         let r = index.search(&[1.0, 0.0, 0.0, 0.0], 1, 8);
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].0, NodeId(0));
+        assert_eq!(r[0].0, 0u64);
+    }
+
+    #[test]
+    fn save_load_levels_roundtrip() {
+        let rng = StdRng::seed_from_u64(7);
+        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, rng);
+        for i in 0..20u32 {
+            index.insert(&[i as f32, 0.0, 0.0, 0.0], i as u64);
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("levels_roundtrip_test.bin");
+        index.save_levels(&path).unwrap();
+
+        let mut index2: HnswNaive =
+            HnswNaive::new(4, 4, 8, 32, top_k_quickselect, StdRng::seed_from_u64(0));
+        index2.load_levels(&path).unwrap();
+        assert_eq!(index.node_ids, index2.node_ids);
+        assert_eq!(index.levels, index2.levels);
     }
 
     /// Matches SIFT recall test scale (10k × dim 128, same RNG seed) to catch arena block / id bugs.
@@ -523,7 +773,7 @@ mod tests {
             let v: Vec<f32> = (0..DIM)
                 .map(|j| ((i * DIM + j) as f32 * 0.03).sin())
                 .collect();
-            index.insert(v.as_slice());
+            index.insert(v.as_slice(), i as u64);
         }
         let q: Vec<f32> = (0..DIM).map(|j| (j as f32 * 0.1).cos()).collect();
         let _ = index.search(&q, 10, 100);

@@ -13,6 +13,7 @@
 //! Eviction drops an entire bucket's arena in one operation — no per-object
 //! cleanup, no fragmentation.
 
+use std::path::PathBuf;
 use std::{collections::VecDeque, time::Duration};
 
 use common::Timestamp;
@@ -56,19 +57,21 @@ impl std::error::Error for ConfigError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketSeq(pub u32);
 
-/// Identifies a node uniquely across all time buckets.
+/// Identifies a result uniquely across all time buckets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BucketedNodeId {
     /// Monotonically increasing sequence number assigned to the bucket on creation.
     pub bucket_seq: BucketSeq,
-    /// Node id within that bucket's HNSW index.
-    pub node_id: NodeId,
+    /// Application-provided vector id passed to [`TimeBucketIndex::insert`].
+    pub vector_id: u64,
 }
 
 struct Bucket {
     seq: BucketSeq,
     created_at: Timestamp,
     index: Box<dyn HnswIndex + Send>,
+    /// Set by `swap_bucket_out`; consumed by `swap_bucket_in` to reload levels.
+    swap_dir: Option<PathBuf>,
 }
 
 /// Multi-HNSW index partitioned into time buckets.
@@ -183,6 +186,7 @@ impl TimeBucketIndex {
             seq,
             created_at: start,
             index,
+            swap_dir: None,
         });
     }
 
@@ -191,7 +195,12 @@ impl TimeBucketIndex {
     /// The target window start is `bucket_start(timestamp)`. If it is ahead of
     /// the current newest bucket a new bucket is created at that grid position.
     /// `timestamp` drives the grid-aligned `created_at` of any new bucket.
-    pub fn insert(&mut self, vector: &[f32], timestamp: Timestamp) -> BucketedNodeId {
+    pub fn insert(
+        &mut self,
+        vector: &[f32],
+        timestamp: Timestamp,
+        vector_id: u64,
+    ) -> BucketedNodeId {
         let start = self.bucket_start(timestamp);
         let needs_new = self.buckets.front().map_or(true, |b| start > b.created_at);
         if needs_new {
@@ -199,10 +208,10 @@ impl TimeBucketIndex {
         }
 
         let bucket = self.buckets.front_mut().expect("just allocated");
-        let node_id = bucket.index.insert(vector);
+        bucket.index.insert(vector, vector_id);
         BucketedNodeId {
             bucket_seq: bucket.seq,
-            node_id,
+            vector_id,
         }
     }
 
@@ -282,11 +291,11 @@ impl TimeBucketIndex {
 
         for i in deque_start..deque_end {
             let bucket = &self.buckets[i];
-            for (node_id, dist) in bucket.index.search(query, k, ef) {
+            for (vector_id, dist) in bucket.index.search(query, k, ef) {
                 all.push((
                     BucketedNodeId {
                         bucket_seq: bucket.seq,
-                        node_id,
+                        vector_id,
                     },
                     adjust_distance_fn(bucket.created_at, dist),
                 ));
@@ -344,6 +353,10 @@ impl TimeBucketIndex {
             return Ok(false);
         };
         bucket.index.swap_out(dir)?;
+        bucket.index.save_levels(&dir.join("levels.bin"))?;
+        bucket.index.save_manifest(&dir.join("manifest.json"))?;
+        bucket.index.clear_level_data();
+        bucket.swap_dir = Some(dir.to_path_buf());
         Ok(true)
     }
 
@@ -354,6 +367,9 @@ impl TimeBucketIndex {
             return Ok(false);
         };
         bucket.index.swap_in()?;
+        if let Some(dir) = bucket.swap_dir.take() {
+            bucket.index.load_levels(&dir.join("levels.bin"))?;
+        }
         Ok(true)
     }
 
@@ -409,7 +425,17 @@ impl TimeBucketIndex {
         }
         std::fs::create_dir_all(local_dir)?;
         crate::blob::download_arena_dir(store, prefix, local_dir).await?;
-        self.swap_bucket_in_from(seq, local_dir)
+        crate::blob::download_levels(store, prefix, &local_dir.join("levels.bin")).await?;
+        crate::blob::download_manifest(store, prefix, &local_dir.join("manifest.json")).await?;
+        let result = self.swap_bucket_in_from(seq, local_dir)?;
+        if let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) {
+            bucket.index.load_levels(&local_dir.join("levels.bin"))?;
+            bucket
+                .index
+                .load_manifest(&local_dir.join("manifest.json"))?;
+            bucket.swap_dir = None;
+        }
+        Ok(result)
     }
 
     /// Swap the bucket identified by `seq` to disk under `local_dir` and immediately
@@ -432,11 +458,12 @@ impl TimeBucketIndex {
         store: &dyn object_store::ObjectStore,
         prefix: &object_store::path::Path,
     ) -> std::io::Result<bool> {
-        let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) else {
+        if !self.swap_bucket_out(seq, local_dir)? {
             return Ok(false);
-        };
-        bucket.index.swap_out(local_dir)?;
+        }
         crate::blob::upload_arena_dir(store, local_dir, prefix).await?;
+        crate::blob::upload_levels(store, &local_dir.join("levels.bin"), prefix).await?;
+        crate::blob::upload_manifest(store, &local_dir.join("manifest.json"), prefix).await?;
         Ok(true)
     }
 }
@@ -477,7 +504,7 @@ mod tests {
     fn single_insert_and_exact_recall() {
         let mut idx = make_index(10);
         let v = [1.0f32, 0.0, 0.0, 0.0];
-        let bid = idx.insert(&v, ts(0));
+        let bid = idx.insert(&v, ts(0), 0u64);
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.bucket_count(), 1);
 
@@ -490,9 +517,9 @@ mod tests {
     fn same_window_stays_in_one_bucket() {
         // duration=10: t=0,5,9 all fall within [0, 10) → no rotation.
         let mut idx = make_index(10);
-        idx.insert(&[0.0; 4], ts(0));
-        idx.insert(&[1.0; 4], ts(5));
-        idx.insert(&[2.0; 4], ts(9));
+        idx.insert(&[0.0; 4], ts(0), 0u64);
+        idx.insert(&[1.0; 4], ts(5), 1u64);
+        idx.insert(&[2.0; 4], ts(9), 2u64);
         assert_eq!(idx.bucket_count(), 1);
         assert_eq!(idx.len(), 3);
     }
@@ -501,10 +528,10 @@ mod tests {
     fn auto_rotate_on_time() {
         // duration=10: t=0 and t=9 share a bucket; t=10 starts a new one.
         let mut idx = make_index(10);
-        idx.insert(&[0.0; 4], ts(0));
-        idx.insert(&[1.0; 4], ts(9));
+        idx.insert(&[0.0; 4], ts(0), 0u64);
+        idx.insert(&[1.0; 4], ts(9), 1u64);
         assert_eq!(idx.bucket_count(), 1);
-        idx.insert(&[2.0; 4], ts(10));
+        idx.insert(&[2.0; 4], ts(10), 2u64);
         assert_eq!(idx.bucket_count(), 2);
         assert_eq!(idx.len(), 3);
     }
@@ -512,10 +539,10 @@ mod tests {
     #[test]
     fn explicit_rotate_bucket() {
         let mut idx = make_index(100);
-        idx.insert(&[0.0; 4], ts(0));
+        idx.insert(&[0.0; 4], ts(0), 0u64);
         idx.rotate_bucket(ts(10));
         assert_eq!(idx.bucket_count(), 2);
-        idx.insert(&[1.0; 4], ts(10));
+        idx.insert(&[1.0; 4], ts(10), 1u64);
         assert_eq!(idx.bucket_count(), 2);
     }
 
@@ -533,8 +560,8 @@ mod tests {
     fn evict_oldest_removes_single_bucket() {
         // duration=1: each new second starts a new bucket.
         let mut idx = make_index(1);
-        idx.insert(&[0.0; 4], ts(0));
-        idx.insert(&[1.0; 4], ts(1));
+        idx.insert(&[0.0; 4], ts(0), 0u64);
+        idx.insert(&[1.0; 4], ts(1), 1u64);
         assert_eq!(idx.bucket_count(), 2);
         let seq = idx.evict_oldest().expect("non-empty");
         assert_eq!(seq, BucketSeq(0)); // seq=0 is the oldest
@@ -545,9 +572,9 @@ mod tests {
     fn evict_before_drops_old_buckets() {
         // duration=1: t=0,1,2 each in their own bucket.
         let mut idx = make_index(1);
-        idx.insert(&[0.0; 4], ts(0));
-        idx.insert(&[1.0; 4], ts(1));
-        idx.insert(&[2.0; 4], ts(2));
+        idx.insert(&[0.0; 4], ts(0), 0u64);
+        idx.insert(&[1.0; 4], ts(1), 1u64);
+        idx.insert(&[2.0; 4], ts(2), 2u64);
         assert_eq!(idx.bucket_count(), 3);
 
         let evicted = idx.evict_before(ts(2)); // drop created_at < ts(2)
@@ -558,7 +585,7 @@ mod tests {
     #[test]
     fn evict_before_no_match_is_noop() {
         let mut idx = make_index(10);
-        idx.insert(&[0.0; 4], ts(10));
+        idx.insert(&[0.0; 4], ts(10), 0u64);
         let evicted = idx.evict_before(ts(5));
         assert_eq!(evicted, 0);
         assert_eq!(idx.bucket_count(), 1);
@@ -569,9 +596,9 @@ mod tests {
         // Older bucket holds the geometrically nearest point; newer holds a farther one.
         // A high penalty on the older bucket must make the newer result win.
         let mut idx = make_index(1);
-        let bid_near = idx.insert(&[0.1f32, 0.0, 0.0, 0.0], ts(0));
+        let bid_near = idx.insert(&[0.1f32, 0.0, 0.0, 0.0], ts(0), 0u64);
         idx.rotate_bucket(ts(1));
-        let bid_far = idx.insert(&[1.0f32, 0.0, 0.0, 0.0], ts(1));
+        let bid_far = idx.insert(&[1.0f32, 0.0, 0.0, 0.0], ts(1), 1u64);
 
         let query = [0.0f32; 4];
 
@@ -608,7 +635,7 @@ mod tests {
         let mut all_bids = Vec::new();
         for i in 0..15usize {
             let v: [f32; DIM] = std::array::from_fn(|j| (i * DIM + j) as f32);
-            all_bids.push(idx.insert(&v, ts(i as u64 / 5)));
+            all_bids.push(idx.insert(&v, ts(i as u64 / 5), i as u64));
         }
         assert_eq!(idx.bucket_count(), 3);
 
@@ -633,11 +660,11 @@ mod tests {
     fn time_range_restricts_to_matching_buckets() {
         // Three buckets: t=0 (duration=10 → window [0,10)), t=10 ([10,20)), t=20 ([20,30)).
         let mut idx = make_index(10);
-        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0)); // bucket [0,10)
-        idx.insert(&[9.0, 0.0, 0.0, 0.0], ts(5)); // also bucket [0,10)
-        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10)); // bucket [10,20)
-        idx.insert(&[9.0, 0.0, 0.0, 0.0], ts(15)); // also bucket [10,20)
-        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20)); // bucket [20,30)
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64); // bucket [0,10)
+        idx.insert(&[9.0, 0.0, 0.0, 0.0], ts(5), 1u64); // also bucket [0,10)
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10), 2u64); // bucket [10,20)
+        idx.insert(&[9.0, 0.0, 0.0, 0.0], ts(15), 3u64); // also bucket [10,20)
+        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20), 4u64); // bucket [20,30)
         assert_eq!(idx.bucket_count(), 3);
 
         let query = [0.0f32; 4];
@@ -734,7 +761,7 @@ mod tests {
         let root = unique_swap_dir("unknown_seq");
         let _guard = DirGuard(root.clone());
         let mut idx = make_index(10);
-        idx.insert(&[1.0; 4], ts(0)); // creates one bucket (seq=0)
+        idx.insert(&[1.0; 4], ts(0), 0u64); // creates one bucket (seq=0)
 
         let dir = root.join("seq_999");
         let moved = idx
@@ -759,9 +786,9 @@ mod tests {
         let root = unique_swap_dir("rt_search");
         let _guard = DirGuard(root.clone());
         let mut idx = make_index(1);
-        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0)); // bucket 0 (seq=0)
-        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(1)); // bucket 1 (seq=1)
-        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(2)); // bucket 2 (seq=2)
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64); // bucket 0 (seq=0)
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(1), 1u64); // bucket 1 (seq=1)
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(2), 2u64); // bucket 2 (seq=2)
         assert_eq!(idx.bucket_count(), 3);
 
         let query = [0.5, 0.0, 0.0, 0.0];
@@ -789,9 +816,9 @@ mod tests {
         let root = unique_swap_dir("mixed_range");
         let _guard = DirGuard(root.clone());
         let mut idx = make_index(10);
-        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0));
-        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10));
-        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20));
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64);
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10), 1u64);
+        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20), 2u64);
 
         idx.swap_bucket_out(bid1.bucket_seq, &root.join("seq_1"))
             .expect("swap_out");
@@ -819,7 +846,7 @@ mod tests {
         let root = unique_swap_dir("double_out");
         let _guard = DirGuard(root.clone());
         let mut idx = make_index(10);
-        idx.insert(&[1.0; 4], ts(0));
+        idx.insert(&[1.0; 4], ts(0), 0u64);
         let seq = BucketSeq(0);
 
         assert!(idx
@@ -842,8 +869,8 @@ mod tests {
         let _guard = DirGuard(root.clone());
 
         let mut idx = make_index(10);
-        idx.insert(&[1.0; 4], ts(0));
-        idx.insert(&[2.0; 4], ts(0));
+        idx.insert(&[1.0; 4], ts(0), 0u64);
+        idx.insert(&[2.0; 4], ts(0), 1u64);
         let seq = BucketSeq(0);
 
         let local = root.join("seq_0");
@@ -864,7 +891,10 @@ mod tests {
                 (p.extension().and_then(|s| s.to_str()) == Some("arena")).then_some(p)
             })
             .collect();
-        assert!(!local_files.is_empty(), "swap_out produced at least one arena file");
+        assert!(
+            !local_files.is_empty(),
+            "swap_out produced at least one arena file"
+        );
 
         for f in &local_files {
             let name = f.file_name().unwrap().to_str().unwrap();
@@ -892,9 +922,9 @@ mod tests {
         let _guard = DirGuard(root.clone());
 
         let mut idx = make_index(10);
-        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0));
-        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0));
-        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0));
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64);
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 1u64);
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 2u64);
         let seq = BucketSeq(0);
 
         let query = [0.5, 0.0, 0.0, 0.0];
@@ -925,18 +955,24 @@ mod tests {
             .expect("swap_bucket_in_from_blob")
             .expect("bucket present");
         assert_eq!(restored, evicted, "every evicted block restored");
-        assert!(restored_dir.exists(), "files materialized locally for swap_in");
+        assert!(
+            restored_dir.exists(),
+            "files materialized locally for swap_in"
+        );
 
         // 4. Search must return identical results — search has been reading entirely
         //    from blob-derived bytes since step 3.
         let after = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
-        assert_eq!(after, before, "search must match baseline after full S3 round-trip");
+        assert_eq!(
+            after, before,
+            "search must match baseline after full S3 round-trip"
+        );
     }
 
     #[tokio::test]
     async fn evict_bucket_unknown_seq_returns_none() {
         let mut idx = make_index(10);
-        idx.insert(&[1.0; 4], ts(0));
+        idx.insert(&[1.0; 4], ts(0), 0u64);
         assert!(idx.evict_bucket(BucketSeq(999)).is_none());
     }
 
@@ -949,7 +985,7 @@ mod tests {
         let _guard = DirGuard(root.clone());
 
         let mut idx = make_index(10);
-        idx.insert(&[1.0; 4], ts(0));
+        idx.insert(&[1.0; 4], ts(0), 0u64);
 
         let local = root.join("seq_999");
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -972,7 +1008,7 @@ mod tests {
         let _guard = DirGuard(root.clone());
 
         let mut idx = make_index(10);
-        idx.insert(&[1.0; 4], ts(0));
+        idx.insert(&[1.0; 4], ts(0), 0u64);
 
         let local = root.join("seq_999");
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());

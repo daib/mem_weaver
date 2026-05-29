@@ -12,6 +12,9 @@ object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -1,6 +1,7 @@
 use crate::hnsw::store::{HnswVectorStore, NaiveVectorStore};
 pub use common::types::NodeId;
 use common::DEFAULT_ARENA_CAPACITY;
+use crc32fast::Hasher as Crc32Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{align_of, size_of};
@@ -402,6 +403,9 @@ impl NodeBlock {
                 let mapped = arena.mapped_bytes();
                 // SAFETY: `arena.as_ptr()` is valid for `mapped` bytes (the anonymous mmap).
                 let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arena.as_ptr(), mapped) };
+                let mut hasher = Crc32Hasher::new();
+                hasher.update(bytes);
+                let checksum = hasher.finalize();
                 let mut file = OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -409,6 +413,7 @@ impl NodeBlock {
                     .truncate(true)
                     .open(path)?;
                 file.write_all(bytes)?;
+                file.write_all(&checksum.to_le_bytes())?;
                 file.flush()?;
                 file
             }
@@ -451,14 +456,35 @@ impl NodeBlock {
     /// blob storage). The block's `len` (node count) and `block_index` are preserved.
     pub fn swap_in_from(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
         let mut file = OpenOptions::new().read(true).open(path.as_ref())?;
-        let len = file.metadata()?.len() as usize;
+        let file_len = file.metadata()?.len() as usize;
+        if file_len < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "arena file too small",
+            ));
+        }
+        let arena_len = file_len - 4;
         let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
-        // SAFETY: anonymous mmap is at least `mapped_bytes() >= len` bytes; we treat
-        // the first `len` bytes as the destination buffer for the file contents.
+        // SAFETY: anonymous mmap is at least `mapped_bytes() >= arena_len` bytes; we treat
+        // the first `arena_len` bytes as the destination buffer for the file contents.
         let dest: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena.mapped_bytes())
         };
-        file.read_exact(&mut dest[..len])?;
+        file.read_exact(&mut dest[..arena_len])?;
+        let mut crc_buf = [0u8; 4];
+        file.read_exact(&mut crc_buf)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(&dest[..arena_len]);
+        let computed_crc = hasher.finalize();
+        if computed_crc != stored_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "arena CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"
+                ),
+            ));
+        }
         // Seal the arena so future push_node calls return None.
         let cap = arena.capacity_bytes();
         let _ = arena.try_alloc_slice_aligned::<u8>(cap, 1);
@@ -474,15 +500,34 @@ impl NodeBlock {
     pub fn swap_in(&mut self) -> io::Result<()> {
         let new_arena = match &mut self.storage {
             NodeBlockStorage::OnDisk(file) => {
-                let len = file.metadata()?.len() as usize;
+                let file_len = file.metadata()?.len() as usize;
+                if file_len < 4 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "arena file too small",
+                    ));
+                }
+                let arena_len = file_len - 4;
                 let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
-                // SAFETY: anonymous mmap is at least `mapped_bytes() >= len` bytes; we treat
-                // the first `len` bytes as the destination buffer for the file contents.
+                // SAFETY: anonymous mmap is at least `mapped_bytes() >= arena_len` bytes; we treat
+                // the first `arena_len` bytes as the destination buffer for the file contents.
                 let dest: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena.mapped_bytes())
                 };
                 file.seek(SeekFrom::Start(0))?;
-                file.read_exact(&mut dest[..len])?;
+                file.read_exact(&mut dest[..arena_len])?;
+                let mut crc_buf = [0u8; 4];
+                file.read_exact(&mut crc_buf)?;
+                let stored_crc = u32::from_le_bytes(crc_buf);
+                let mut hasher = Crc32Hasher::new();
+                hasher.update(&dest[..arena_len]);
+                let computed_crc = hasher.finalize();
+                if computed_crc != stored_crc {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("arena CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"),
+                    ));
+                }
                 // Seal: advance bump to the full capacity so future push_node calls return None.
                 let cap = arena.capacity_bytes();
                 let _ = arena.try_alloc_slice_aligned::<u8>(cap, 1);
@@ -738,6 +783,10 @@ pub trait HnswNodeStore {
     /// Restore every storage unit by reading `dir/block_<i>.arena`. Default: no-op.
     fn swap_in_from(&mut self, _dir: &Path) -> io::Result<usize> {
         Ok(0)
+    }
+    /// Names of arena backing files produced by [`Self::swap_out`]. Default: empty.
+    fn arena_file_names(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -1002,6 +1051,13 @@ impl HnswNodeStore for ArenaNodeStore {
 
     fn swap_in_from(&mut self, dir: &Path) -> io::Result<usize> {
         ArenaNodeStore::swap_in_from(self, dir)
+    }
+
+    fn arena_file_names(&self) -> Vec<String> {
+        self.blocks
+            .iter()
+            .map(|b| format!("block_{}.arena", b.block_index))
+            .collect()
     }
 }
 #[cfg(test)]

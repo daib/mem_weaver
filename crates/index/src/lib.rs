@@ -8,7 +8,10 @@ pub mod blob;
 mod hnsw;
 mod time_bucket;
 
-pub use blob::{download_arena_dir, upload_arena_dir, Uploaded};
+pub use blob::{
+    download_arena_dir, download_levels, download_manifest, upload_arena_dir, upload_levels,
+    upload_manifest, Uploaded,
+};
 pub use hnsw::{
     ArenaNodeStore, GraphNode, Hnsw, HnswArena, HnswIndex, HnswNaive, HnswNodeStore,
     HnswVectorStore, NaiveNodeStore, NodeBlock, NodeId, DEFAULT_ALIGNMENT,

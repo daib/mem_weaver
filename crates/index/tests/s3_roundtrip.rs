@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use common::top_k_quickselect;
 use futures::stream::StreamExt;
-use index::{download_arena_dir, upload_arena_dir, HnswArena, HnswIndex, NodeId};
+use index::{download_arena_dir, upload_arena_dir, HnswArena, HnswIndex};
 use object_store::{path::Path as ObjectPath, ObjectStore};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -75,12 +75,12 @@ async fn upload_arena_to_s3_then_download_and_query() {
         StdRng::seed_from_u64(0xABCD_1234),
     );
     let mut rng = StdRng::seed_from_u64(0x7777);
-    for _ in 0..N {
+    for i in 0..N {
         let v: Vec<f32> = (0..DIM).map(|_| rng.gen::<f32>()).collect();
-        idx.insert(&v);
+        idx.insert(&v, i as u64);
     }
     let query: Vec<f32> = (0..DIM).map(|_| rng.gen::<f32>()).collect();
-    let before: Vec<(NodeId, f32)> = idx.search(&query, K, EF);
+    let before: Vec<(u64, f32)> = idx.search(&query, K, EF);
     assert_eq!(before.len(), K, "baseline query must return K hits");
 
     // 2. Swap arena blocks to a local dir.
@@ -89,14 +89,22 @@ async fn upload_arena_to_s3_then_download_and_query() {
     assert!(moved >= 1, "swap_out must produce at least one arena file");
     let local_files = list_arena_files(local_out.path());
     assert_eq!(local_files.len(), moved, "file count matches block count");
-    eprintln!("swap_out produced {moved} arena file(s) in {:?}", local_out.path());
+    eprintln!(
+        "swap_out produced {moved} arena file(s) in {:?}",
+        local_out.path()
+    );
 
     // 3. Upload to S3 under a unique prefix.
     let uploaded = upload_arena_dir(store.as_ref(), local_out.path(), &cfg.prefix)
         .await
         .expect("upload_arena_dir");
     assert_eq!(uploaded.len(), moved, "every block uploaded");
-    eprintln!("uploaded {} block(s) to s3://{}/{}", uploaded.len(), cfg.bucket, cfg.prefix);
+    eprintln!(
+        "uploaded {} block(s) to s3://{}/{}",
+        uploaded.len(),
+        cfg.bucket,
+        cfg.prefix
+    );
 
     // Cleanup uploaded objects on every exit path beyond this point.
     let cleanup = Cleanup {
@@ -105,7 +113,9 @@ async fn upload_arena_to_s3_then_download_and_query() {
     };
 
     // 4. Verify the list under the prefix matches.
-    let listed = list_prefix(store.as_ref(), &cfg.prefix).await.expect("list");
+    let listed = list_prefix(store.as_ref(), &cfg.prefix)
+        .await
+        .expect("list");
     assert_eq!(
         listed.len(),
         uploaded.len(),
@@ -163,7 +173,11 @@ impl TestConfig {
                 "bucket name {bucket:?} contains '/'. S3 bucket names cannot contain slashes — \
                  the slash you wrote is the object-key delimiter, not a bucket separator. \
                  Set DEFAULT_BUCKET={head:?} (or {tail:?}) and DEFAULT_PREFIX={:?} instead.",
-                if head == "dev" || head == "stage" || head == "prod" { head } else { tail }
+                if head == "dev" || head == "stage" || head == "prod" {
+                    head
+                } else {
+                    tail
+                }
             ));
         }
         let region =

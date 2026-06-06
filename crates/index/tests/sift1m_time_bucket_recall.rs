@@ -208,7 +208,7 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
                     index
                         .search(q, K, ef, |_, d| d, None, top_k_quickselect)
                         .into_iter()
-                        .map(|bid| VectorId(bid.vector_id))
+                        .map(|(vid, _)| VectorId(vid))
                         .collect()
                 });
             stats
@@ -392,6 +392,13 @@ impl S3Setup {
         }
         let region = helpers::s3::resolve("MEM_WEAVER_S3_REGION", DEFAULT_REGION);
         let profile = helpers::s3::resolve("MEM_WEAVER_S3_PROFILE", DEFAULT_PROFILE);
+
+        // Skip gracefully when AWS credentials are not available.
+        if let Err(e) = helpers::s3::builder_from_profile(&profile, &bucket, &region) {
+            eprintln!("s3: credentials not available ({e}); S3 upload step skipped");
+            return Ok(None);
+        }
+
         // Prefix: env literal wins. Otherwise append a unique run id under DEFAULT_PREFIX
         // (or under a generic prefix if DEFAULT_PREFIX is empty) so concurrent runs and
         // re-runs each get their own subtree.

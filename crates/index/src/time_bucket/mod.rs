@@ -69,7 +69,7 @@ pub struct BucketedNodeId {
 struct Bucket {
     seq: BucketSeq,
     created_at: Timestamp,
-    index: Box<dyn HnswIndex + Send>,
+    index: Box<dyn HnswIndex + Send + Sync>,
     /// Set by `swap_bucket_out`; consumed by `swap_bucket_in` to reload levels.
     swap_dir: Option<PathBuf>,
 }
@@ -155,6 +155,11 @@ impl TimeBucketIndex {
         })
     }
 
+    /// Returns `true` if a bucket with `seq` is tracked by this index.
+    pub fn has_bucket(&self, seq: BucketSeq) -> bool {
+        self.buckets.iter().any(|b| b.seq == seq)
+    }
+
     /// Total number of vectors across all buckets.
     pub fn len(&self) -> usize {
         self.buckets.iter().map(|b| b.index.len()).sum()
@@ -173,7 +178,7 @@ impl TimeBucketIndex {
         let seq = self.next_seq;
         self.next_seq.0 += 1;
         let bucket_rng = StdRng::seed_from_u64(self.rng.gen());
-        let index: Box<dyn HnswIndex + Send> = Box::new(HnswArena::new(
+        let index: Box<dyn HnswIndex + Send + Sync> = Box::new(HnswArena::new(
             self.dim,
             self.m,
             self.m_max0,
@@ -251,7 +256,7 @@ impl TimeBucketIndex {
         adjust_distance_fn: impl Fn(Timestamp, f32) -> f32,
         time_range: Option<std::ops::Range<Timestamp>>,
         top_k_fn: fn(&[(BucketedNodeId, f32)], usize) -> Vec<BucketedNodeId>,
-    ) -> Vec<BucketedNodeId> {
+    ) -> Vec<(u64, f32)> {
         let n = self.buckets.len();
         if n == 0 {
             return Vec::new();
@@ -302,7 +307,11 @@ impl TimeBucketIndex {
             }
         }
 
-        top_k_fn(&all, k)
+        let bids = top_k_fn(&all, k);
+        let score_map: std::collections::HashMap<BucketedNodeId, f32> = all.into_iter().collect();
+        bids.into_iter()
+            .map(|bid| (bid.vector_id, score_map[&bid]))
+            .collect()
     }
 
     /// Drop all buckets whose window starts strictly before `timestamp`.
@@ -406,9 +415,30 @@ impl TimeBucketIndex {
         Ok(Some(bucket.index.swap_in_from(dir)?))
     }
 
+    /// Restore the bucket identified by `seq` from files already present in `local_dir`.
+    /// Expects `block_*.arena`, `levels.bin`, and `manifest.json` to be present
+    /// (same layout that [`TimeBucketIndex::swap_bucket_out`] produces).
+    ///
+    /// Returns `Ok(Some(num_restored))` on success, `Ok(None)` if the bucket isn't found.
+    pub fn restore_bucket_from_local(
+        &mut self,
+        seq: BucketSeq,
+        local_dir: &std::path::Path,
+    ) -> std::io::Result<Option<usize>> {
+        let result = self.swap_bucket_in_from(seq, local_dir)?;
+        if let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) {
+            bucket.index.load_levels(&local_dir.join("levels.bin"))?;
+            bucket
+                .index
+                .load_manifest(&local_dir.join("manifest.json"))?;
+            bucket.swap_dir = None;
+        }
+        Ok(result)
+    }
+
     /// Download `<prefix>/block_*.arena` from `store` into `local_dir`, then restore the
     /// bucket identified by `seq` by reading those files. Convenience wrapper around
-    /// [`crate::download_arena_dir`] + [`TimeBucketIndex::swap_bucket_in_from`].
+    /// [`crate::download_arena_dir`] + [`TimeBucketIndex::restore_bucket_from_local`].
     ///
     /// `local_dir` is created if missing. Returns `Ok(Some(num_restored))` if the bucket
     /// was found, `Ok(None)` otherwise.
@@ -427,15 +457,7 @@ impl TimeBucketIndex {
         crate::blob::download_arena_dir(store, prefix, local_dir).await?;
         crate::blob::download_levels(store, prefix, &local_dir.join("levels.bin")).await?;
         crate::blob::download_manifest(store, prefix, &local_dir.join("manifest.json")).await?;
-        let result = self.swap_bucket_in_from(seq, local_dir)?;
-        if let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) {
-            bucket.index.load_levels(&local_dir.join("levels.bin"))?;
-            bucket
-                .index
-                .load_manifest(&local_dir.join("manifest.json"))?;
-            bucket.swap_dir = None;
-        }
-        Ok(result)
+        self.restore_bucket_from_local(seq, local_dir)
     }
 
     /// Swap the bucket identified by `seq` to disk under `local_dir` and immediately
@@ -510,7 +532,7 @@ mod tests {
 
         let results = idx.search(&v, 1, 8, |_, d| d, None, top_k_quickselect);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], bid);
+        assert_eq!(results[0].0, bid.vector_id);
     }
 
     #[test]
@@ -603,7 +625,7 @@ mod tests {
         let query = [0.0f32; 4];
 
         let unweighted = idx.search(&query, 1, 16, |_, d| d, None, top_k_quickselect);
-        assert_eq!(unweighted[0], bid_near);
+        assert_eq!(unweighted[0].0, bid_near.vector_id);
 
         let weighted = idx.search(
             &query,
@@ -613,7 +635,7 @@ mod tests {
             None,
             top_k_quickselect,
         );
-        assert_eq!(weighted[0], bid_far);
+        assert_eq!(weighted[0].0, bid_far.vector_id);
     }
 
     #[test]
@@ -632,10 +654,9 @@ mod tests {
         )
         .unwrap();
 
-        let mut all_bids = Vec::new();
         for i in 0..15usize {
             let v: [f32; DIM] = std::array::from_fn(|j| (i * DIM + j) as f32);
-            all_bids.push(idx.insert(&v, ts(i as u64 / 5), i as u64));
+            idx.insert(&v, ts(i as u64 / 5), i as u64);
         }
         assert_eq!(idx.bucket_count(), 3);
 
@@ -643,17 +664,14 @@ mod tests {
         let results = idx.search(&query, K, 32, |_, d| d, None, top_k_quickselect);
         assert_eq!(results.len(), K);
 
-        let query_v = [0.0f32; DIM];
-        let mut brute: Vec<_> = all_bids
-            .iter()
-            .enumerate()
-            .map(|(i, &bid)| {
+        let mut brute: Vec<(u64, f32)> = (0..15usize)
+            .map(|i| {
                 let v: Vec<f32> = (0..DIM).map(|j| (i * DIM + j) as f32).collect();
-                (bid, euclidean_distance_sq(&query_v, &v))
+                (i as u64, euclidean_distance_sq(&query, &v))
             })
             .collect();
         brute.sort_by(|a, b| a.1.total_cmp(&b.1));
-        assert!(results.contains(&brute[0].0));
+        assert!(results.iter().any(|(vid, _)| *vid == brute[0].0));
     }
 
     #[test]
@@ -669,7 +687,7 @@ mod tests {
 
         let query = [0.0f32; 4];
 
-        // Only bucket [0,10) — must contain bid0, not bid1/bid2.
+        // Only bucket [0,10) — vector_ids 0 and 1; must not include 2, 3, or 4.
         let r = idx.search(
             &query,
             10,
@@ -678,11 +696,12 @@ mod tests {
             Some(ts(0)..ts(10)),
             top_k_quickselect,
         );
-        let ids: Vec<_> = r.iter().map(|b| b.bucket_seq).collect();
-        assert!(ids.iter().all(|&s| s == bid0.bucket_seq));
-        assert!(!ids.contains(&bid1.bucket_seq));
+        assert!(r.iter().all(|(v, _)| *v == 0 || *v == 1));
+        assert!(!r
+            .iter()
+            .any(|(v, _)| *v == bid1.vector_id || *v == bid2.vector_id));
 
-        // Only bucket [10,20) — must contain bid1.
+        // Only bucket [10,20) — vector_ids 2 and 3.
         let r = idx.search(
             &query,
             10,
@@ -691,10 +710,9 @@ mod tests {
             Some(ts(10)..ts(20)),
             top_k_quickselect,
         );
-        let ids: Vec<_> = r.iter().map(|b| b.bucket_seq).collect();
-        assert!(ids.iter().all(|&s| s == bid1.bucket_seq));
+        assert!(r.iter().all(|(v, _)| *v == 2 || *v == 3));
 
-        // Span [5,25) overlaps [0,10), [10,20), [20,30) — all three buckets searched.
+        // Span [5,25) overlaps [0,10), [10,20), [20,30) — vectors from all three buckets.
         let r = idx.search(
             &query,
             10,
@@ -703,10 +721,10 @@ mod tests {
             Some(ts(5)..ts(25)),
             top_k_quickselect,
         );
-        let seqs: std::collections::HashSet<_> = r.iter().map(|b| b.bucket_seq).collect();
-        assert!(seqs.contains(&bid0.bucket_seq));
-        assert!(seqs.contains(&bid1.bucket_seq));
-        assert!(seqs.contains(&bid2.bucket_seq));
+        let vids: std::collections::HashSet<u64> = r.iter().map(|(v, _)| *v).collect();
+        assert!(vids.contains(&bid0.vector_id) || vids.contains(&1));
+        assert!(vids.contains(&bid1.vector_id) || vids.contains(&3));
+        assert!(vids.contains(&bid2.vector_id));
 
         // Empty range returns nothing.
         assert!(idx
@@ -832,10 +850,10 @@ mod tests {
             Some(ts(0)..ts(30)),
             top_k_quickselect,
         );
-        let seqs: std::collections::HashSet<_> = all.iter().map(|b| b.bucket_seq).collect();
-        assert!(seqs.contains(&bid0.bucket_seq));
-        assert!(seqs.contains(&bid1.bucket_seq), "cold bucket missing");
-        assert!(seqs.contains(&bid2.bucket_seq));
+        let vids: std::collections::HashSet<u64> = all.iter().map(|(v, _)| *v).collect();
+        assert!(vids.contains(&bid0.vector_id));
+        assert!(vids.contains(&bid1.vector_id), "cold bucket missing");
+        assert!(vids.contains(&bid2.vector_id));
     }
 
     #[test]

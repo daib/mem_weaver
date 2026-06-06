@@ -16,4 +16,4 @@ pub use hnsw::{
     ArenaNodeStore, GraphNode, Hnsw, HnswArena, HnswIndex, HnswNaive, HnswNodeStore,
     HnswVectorStore, NaiveNodeStore, NodeBlock, NodeId, DEFAULT_ALIGNMENT,
 };
-pub use time_bucket::{BucketedNodeId, ConfigError, TimeBucketIndex};
+pub use time_bucket::{BucketSeq, BucketedNodeId, ConfigError, TimeBucketIndex};

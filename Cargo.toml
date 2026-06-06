@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/common",
+    "crates/grpc",
     "crates/index",
     "crates/mem",
     "crates/vector",
@@ -20,3 +21,5 @@ bytes = "1"
 futures = "0.3"
 crc32fast = "1"
 serde_json = "1"
+tonic = "0.12"
+prost = "0.13"

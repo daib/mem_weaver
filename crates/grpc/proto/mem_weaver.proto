@@ -1,0 +1,123 @@
+syntax = "proto3";
+package mem_weaver.v1;
+
+service MemWeaver {
+  rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+  rpc BatchInsert(BatchInsertRequest) returns (BatchInsertResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+
+  // ── Bucket persistence ──────────────────────────────────────────────────────
+  rpc SwapBucketOut(SwapBucketOutRequest) returns (SwapBucketOutResponse);
+  rpc SwapBucketIn(SwapBucketInRequest) returns (SwapBucketInResponse);
+  rpc EvictBucket(EvictBucketRequest) returns (EvictBucketResponse);
+  rpc SwapBucketOutToBlob(SwapBucketOutToBlobRequest) returns (SwapBucketOutToBlobResponse);
+  rpc SwapBucketInFromBlob(SwapBucketInFromBlobRequest) returns (SwapBucketInFromBlobResponse);
+}
+
+// ── Collection management ────────────────────────────────────────────────────
+
+message CreateCollectionRequest {
+  string collection           = 1;
+  uint32 dim                  = 2;
+  uint32 m                    = 3;
+  uint32 m_max0               = 4;
+  uint32 ef_construction      = 5;
+  uint64 bucket_duration_secs = 6;
+}
+
+message CreateCollectionResponse {}
+
+// ── Insert ───────────────────────────────────────────────────────────────────
+
+message InsertItem {
+  repeated float vector    = 1;
+  uint64         timestamp = 2;
+  uint64         vector_id = 3;
+}
+
+message InsertResult {
+  uint32 bucket_seq = 1;
+  uint64 vector_id  = 2;
+}
+
+message BatchInsertRequest {
+  string             collection = 1;
+  repeated InsertItem items     = 2;
+}
+
+message BatchInsertResponse {
+  repeated InsertResult results = 1;
+}
+
+// ── Search ───────────────────────────────────────────────────────────────────
+
+message SearchRequest {
+  string         collection       = 1;
+  repeated float query            = 2;
+  uint32         k                = 3;
+  uint32         ef               = 4;
+  optional uint64 time_range_start = 5;
+  optional uint64 time_range_end   = 6;
+}
+
+message SearchHit {
+  uint64 vector_id = 1;
+  float  distance  = 2;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+}
+
+// ── Bucket persistence ───────────────────────────────────────────────────────
+
+message SwapBucketOutRequest {
+  string collection = 1;
+  uint32 bucket_seq = 2;
+}
+
+message SwapBucketOutResponse {
+  bool found = 1;
+}
+
+message SwapBucketInRequest {
+  string collection = 1;
+  uint32 bucket_seq = 2;
+}
+
+message SwapBucketInResponse {
+  bool found = 1;
+}
+
+message EvictBucketRequest {
+  string collection = 1;
+  uint32 bucket_seq = 2;
+}
+
+message EvictBucketResponse {
+  bool   found         = 1;
+  uint32 evicted_count = 2;
+}
+
+// Swaps bucket to local disk then uploads to the server's configured S3 store.
+// Requires the server to be started with S3 storage configured.
+message SwapBucketOutToBlobRequest {
+  string collection = 1;
+  uint32 bucket_seq = 2;
+}
+
+message SwapBucketOutToBlobResponse {
+  bool found = 1;
+}
+
+// Downloads bucket from the server's configured S3 store then restores it.
+// Requires the server to be started with S3 storage configured.
+message SwapBucketInFromBlobRequest {
+  string collection = 1;
+  uint32 bucket_seq = 2;
+}
+
+message SwapBucketInFromBlobResponse {
+  bool   found          = 1;
+  uint32 restored_count = 2;
+}

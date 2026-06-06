@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mem-weaver
+description: Vector database with predictable memory costs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

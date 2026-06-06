@@ -324,7 +324,7 @@ impl<N: HnswNodeStore> Hnsw<N> {
         new_id
     }
 
-    /// k-NN search: returns up to `k` pairs `(internal_id, distance_sq)` sorted by distance.
+    /// k-NN search: returns up to `k` pairs `(vector_id, distance_sq)` sorted by distance.
     /// `ef` is the dynamic list size at level 0 (must be ≥ `k`).
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         assert_eq!(query.len(), self.dim);
@@ -517,7 +517,6 @@ impl<N: HnswNodeStore> Hnsw<N> {
             pos += 8;
         }
         let levels = data[pos..pos + count].to_vec();
-        pos += count;
         let mut node_to_vector_id = HashMap::with_capacity(count);
         for (nid, &vid) in node_ids.iter().zip(vector_ids.iter()) {
             node_to_vector_id.insert(nid.0, vid);

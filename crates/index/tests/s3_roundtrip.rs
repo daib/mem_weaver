@@ -3,13 +3,14 @@
 //! [`index::download_arena_dir`], and verify that querying the swapped-in index
 //! returns the same results as before.
 //!
-//! Marked `#[ignore]` so default `cargo test` runs skip it. Run it explicitly:
+//! Skips automatically when AWS credentials are not available. To run against a
+//! real bucket:
 //!
 //! ```bash
 //! MEM_WEAVER_S3_BUCKET=my-bucket \
 //! MEM_WEAVER_S3_REGION=us-east-1 \
 //! MEM_WEAVER_S3_PROFILE=default \
-//! cargo test -p index --test s3_roundtrip -- --ignored --nocapture
+//! cargo test -p index --test s3_roundtrip -- --nocapture
 //! ```
 //!
 //! Credentials are read from `~/.aws/credentials` for the named profile (default `"default"`).
@@ -47,7 +48,6 @@ const DEFAULT_PROFILE: &str = "default";
 const DEFAULT_PREFIX: &str = "dev";
 
 #[tokio::test]
-#[ignore = "requires real S3 credentials; run with --ignored"]
 async fn upload_arena_to_s3_then_download_and_query() {
     let cfg = match TestConfig::from_env() {
         Ok(c) => c,
@@ -184,6 +184,12 @@ impl TestConfig {
             std::env::var("MEM_WEAVER_S3_REGION").unwrap_or_else(|_| DEFAULT_REGION.into());
         let profile =
             std::env::var("MEM_WEAVER_S3_PROFILE").unwrap_or_else(|_| DEFAULT_PROFILE.into());
+
+        // Skip gracefully when AWS credentials are not available.
+        if let Err(e) = helpers::s3::builder_from_profile(&profile, &bucket, &region) {
+            return Err(format!("credentials not available ({e}); skipping S3 test"));
+        }
+
         let prefix = std::env::var("MEM_WEAVER_S3_PREFIX")
             .ok()
             .or_else(|| (!DEFAULT_PREFIX.is_empty()).then(|| DEFAULT_PREFIX.to_string()))

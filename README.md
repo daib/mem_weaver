@@ -259,8 +259,10 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] Explicit hot/cold tiering — swap_out / swap_in
 - [x] Bit-perfect restore — identical recall after swap cycle
 - [x] Cold bucket search via temporary file read
-- [ ] S3/GCS/Azure cold tier via `object_store`
+- [x] S3/GCS/Azure cold tier via `object_store`
+- [x] Store metadata
 - [ ] Memory controller — automatic eviction policy
+- [ ] Crash recovery from S3
 - [ ] pgvector comparison benchmarks
 - [ ] Parallel index construction (level-lock pipelining)
 - [ ] Per-cluster HNSW for reader node cold tier

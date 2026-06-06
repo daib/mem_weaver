@@ -1,0 +1,35 @@
+replicaCount: 1
+
+image:
+  repository: mem-weaver
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 50051
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: 2
+    memory: 4Gi
+
+persistence:
+  enabled: true
+  storageClass: ""
+  size: 10Gi
+
+env:
+  LISTEN_ADDR: "0.0.0.0:50051"
+  DATA_DIR: "/data"
+
+s3:
+  enabled: false
+  bucket: ""
+  region: "us-east-1"
+  prefix: "mem-weaver"
+  # AWS credentials — set via secretRef in production
+  secretName: ""

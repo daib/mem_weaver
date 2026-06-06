@@ -237,6 +237,11 @@ pub struct NodeBlock {
     m_max0: usize, // target max degree on level 0
 }
 
+// SAFETY: The mmap pointer inside NodeBlockStorage is read-only during search.
+// Mutations (insert, swap_out, swap_in) always happen under an exclusive write lock,
+// so shared read access across threads is safe.
+unsafe impl Sync for NodeBlock {}
+
 impl NodeBlock {
     pub fn try_new(dim: usize, m: usize, m_max0: usize, block_index: usize) -> Option<Self> {
         Some(Self {

@@ -13,18 +13,18 @@
 //! Run:
 //!   MEMWEAVER_K8S_TEST=1 cargo test --test k8s_deploy -- --nocapture
 
+use std::collections::{BTreeMap, HashSet};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
+use common::benchmark::try_load_sift_ctx;
 use common::read_fvecs_vector_at;
 use grpc::proto::{
-    mem_weaver_client::MemWeaverClient, BatchInsertRequest, CreateCollectionRequest, InsertItem,
-    SearchRequest,
+    mem_weaver_client::MemWeaverClient, BatchInsertRequest, CreateCollectionRequest,
+    EvictBucketRequest, InsertItem, SearchRequest,
 };
 use tonic::transport::Channel;
-use vector::VectorId;
 
 const RELEASE_NAME: &str = "mw-itest";
 const NAMESPACE: &str = "default";
@@ -37,6 +37,9 @@ const DEFAULT_N_BASE: usize = 8_192;
 const DEFAULT_N_QUERIES: usize = 10;
 const DEFAULT_EF: usize = 100;
 const MIN_RECALL: f32 = 0.75;
+// Maximum vectors kept in memory. When exceeded, the oldest bucket is evicted.
+// Override with MEMWEAVER_MEM_LIMIT.
+const DEFAULT_MEM_LIMIT: usize = 4_096;
 
 fn chart_dir() -> String {
     format!("{}/../../k8s/mem-weaver", env!("CARGO_MANIFEST_DIR"))
@@ -275,6 +278,14 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
         return;
     };
 
+    let mem_limit: usize = std::env::var("MEMWEAVER_MEM_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MEM_LIMIT)
+        .min(ctx.n_base);
+
+    // Size buckets so roughly 4 buckets form before the limit is first hit.
+    let vectors_per_bucket = ((mem_limit / 4) as u64).max(256);
     let ef = ctx.search_ef.max(K as usize);
 
     client
@@ -284,17 +295,24 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
             m: 16,
             m_max0: 32,
             ef_construction: 200,
-            bucket_duration_secs: 0,
+            // timestamp == vector_id, so this partitions the corpus evenly.
+            bucket_duration_secs: vectors_per_bucket,
         })
         .await
         .expect("CreateCollection");
 
-    // Load corpus into memory (needed for brute-force ground truth later).
+    // Load full corpus into memory for ground-truth computation.
     let corpus: Vec<Vec<f32>> = (0..ctx.n_base)
         .map(|i| read_fvecs_vector_at(ctx.base_data(), ctx.dim, i).expect("base fvecs"))
         .collect();
 
-    // Insert in batches.
+    // bucket_seq -> corpus indices of vectors in that bucket (for ground-truth filtering).
+    let mut bucket_map: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    // corpus indices that have been evicted.
+    let mut evicted_ids: HashSet<u64> = HashSet::new();
+    let mut in_memory: usize = 0;
+    let mut total_evicted: usize = 0;
+
     let t_insert = Instant::now();
     for (chunk_idx, chunk) in corpus.chunks(BATCH_SIZE).enumerate() {
         let base = chunk_idx * BATCH_SIZE;
@@ -303,28 +321,86 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
             .enumerate()
             .map(|(j, v)| InsertItem {
                 vector: v.clone(),
-                timestamp: 0,
+                // Use vector_id as timestamp so vectors spread across time buckets.
+                timestamp: (base + j) as u64,
                 vector_id: (base + j) as u64,
             })
             .collect();
-        client
-            .batch_insert(BatchInsertRequest {
-                collection: COLLECTION.into(),
-                items,
-            })
+
+        let resp = client
+            .batch_insert(BatchInsertRequest { collection: COLLECTION.into(), items })
             .await
             .expect("BatchInsert");
+
+        for r in resp.into_inner().results {
+            bucket_map.entry(r.bucket_seq).or_default().push(r.vector_id as usize);
+            in_memory += 1;
+        }
+
+        // Evict oldest buckets while over the memory limit.
+        while in_memory > mem_limit {
+            let Some((&oldest_seq, _)) = bucket_map.first_key_value() else { break };
+            let evict_resp = client
+                .evict_bucket(EvictBucketRequest {
+                    collection: COLLECTION.into(),
+                    bucket_seq: oldest_seq,
+                })
+                .await
+                .expect("EvictBucket");
+
+            let server_count = evict_resp.into_inner().evicted_count as usize;
+            let indices = bucket_map.remove(&oldest_seq).unwrap_or_default();
+            for &idx in &indices {
+                evicted_ids.insert(idx as u64);
+            }
+            in_memory = in_memory.saturating_sub(indices.len());
+            total_evicted += indices.len();
+            eprintln!(
+                "evicted bucket seq={oldest_seq}: server={server_count} tracked={}  \
+                 in_memory={in_memory}",
+                indices.len()
+            );
+        }
     }
+
     eprintln!(
-        "sift1m: inserted {} vectors in {:.1} ms",
+        "sift1m: inserted {} vectors in {:.1} ms  \
+         in_memory={in_memory} evicted={total_evicted}",
         ctx.n_base,
-        t_insert.elapsed().as_secs_f64() * 1e3
+        t_insert.elapsed().as_secs_f64() * 1e3,
     );
 
-    // Search all queries, collect results for recall computation.
-    let mut search_results: Vec<Vec<VectorId>> = Vec::with_capacity(ctx.n_q);
+    // Eviction must have fired if n_base > mem_limit.
+    if ctx.n_base > mem_limit {
+        assert!(total_evicted > 0, "expected evictions for n_base={} mem_limit={mem_limit}", ctx.n_base);
+    }
+
+    // Build surviving corpus (only in-memory vectors, preserving original IDs).
+    let surviving: Vec<(u64, &Vec<f32>)> = corpus
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !evicted_ids.contains(&(*i as u64)))
+        .map(|(i, v)| (i as u64, v))
+        .collect();
+
+    // Search all queries and verify:
+    //   1. No evicted vector ID appears in results.
+    //   2. Recall@K vs brute-force over surviving corpus meets MIN_RECALL.
+    let mut recalls: Vec<f32> = Vec::with_capacity(ctx.n_q);
     for qi in 0..ctx.n_q {
         let query = read_fvecs_vector_at(ctx.q_data(), ctx.dim, qi).expect("query fvecs");
+
+        // Brute-force ground truth restricted to surviving vectors.
+        let mut scored: Vec<(u64, f32)> = surviving
+            .iter()
+            .map(|(id, v)| {
+                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                (*id, d)
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let gt: HashSet<u64> = scored.iter().take(K as usize).map(|(id, _)| *id).collect();
+
         let resp = client
             .search(SearchRequest {
                 collection: COLLECTION.into(),
@@ -335,35 +411,27 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
             })
             .await
             .expect("Search");
-        let hits: Vec<VectorId> = resp
-            .into_inner()
-            .hits
-            .into_iter()
-            .map(|h| VectorId(h.vector_id))
-            .collect();
-        search_results.push(hits);
+
+        let hits = resp.into_inner().hits;
+        for h in &hits {
+            assert!(
+                !evicted_ids.contains(&h.vector_id),
+                "evicted vector_id={} appeared in search results",
+                h.vector_id
+            );
+        }
+
+        let overlap = hits.iter().filter(|h| gt.contains(&h.vector_id)).count();
+        recalls.push(overlap as f32 / K as f32);
     }
 
-    // Compute recall@K vs brute-force ground truth.
-    let mut result_iter = search_results.into_iter();
-    let (stats, _, _) = sift_recall_stats(
-        "k8s/sift1m",
-        &corpus,
-        ctx.q_data(),
-        ctx.dim,
-        ctx.n_q,
-        ef,
-        |_q| result_iter.next().unwrap(),
-    );
+    let min_recall = recalls.iter().cloned().fold(f32::INFINITY, f32::min);
+    let mean_recall = recalls.iter().sum::<f32>() / recalls.len() as f32;
+    eprintln!("sift1m: recall@{K} min={min_recall:.4} mean={mean_recall:.4} — passed");
 
     assert!(
-        stats.min >= MIN_RECALL,
-        "k8s/sift1m: recall@{K} min={:.4} expected >= {MIN_RECALL}",
-        stats.min
-    );
-    eprintln!(
-        "sift1m: recall@{K} min={:.4} mean={:.4} p95={:.4} — passed",
-        stats.min, stats.mean, stats.p95
+        min_recall >= MIN_RECALL,
+        "k8s/sift1m: recall@{K} min={min_recall:.4} expected >= {MIN_RECALL}"
     );
 }
 

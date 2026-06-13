@@ -26,7 +26,7 @@ env:
   LISTEN_ADDR: "0.0.0.0:50051"
   DATA_DIR: "/data"
 
-s3:
+blob:
   enabled: false
   bucket: ""
   region: "us-east-1"

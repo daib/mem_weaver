@@ -21,6 +21,17 @@ pub trait HnswIndex {
     fn len(&self) -> usize;
     fn insert(&mut self, vector: &[f32], vector_id: u64) -> NodeId;
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)>;
+    /// Populate the index's arena from `block_*.arena` files in `dir`, replacing any
+    /// existing blocks. Used during crash recovery. No-op for non-arena indexes.
+    fn load_blocks_from_dir(&mut self, dir: &std::path::Path) -> std::io::Result<usize>;
+    /// Recompute per-block node counts from the in-memory `node_ids` loaded by
+    /// [`load_levels`]. Must be called after both [`load_blocks_from_dir`] and
+    /// [`load_levels`] so that `len()` / `is_empty()` return correct values.
+    fn rebuild_lens(&mut self);
+    /// Copy in-memory arena blocks to `dir` without changing storage state. Returns the
+    /// number of blocks written. Output format matches [`swap_out`], so the files can be
+    /// uploaded to S3 and later restored via [`swap_in_from`]. No-op for non-arena indexes.
+    fn snapshot_to_dir(&self, dir: &std::path::Path) -> std::io::Result<usize>;
     /// Move the index's hot data to disk under `dir`. Returns the number of underlying
     /// storage units (e.g. arena node blocks) that transitioned to on-disk state.
     /// No-op for indexes without arena-backed storage (e.g. naive heap).
@@ -132,6 +143,18 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
 
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
         Hnsw::search(self, query, k, ef)
+    }
+
+    fn load_blocks_from_dir(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {
+        self.graph.load_from_dir(dir)
+    }
+
+    fn rebuild_lens(&mut self) {
+        self.graph.rebuild_lens_from_node_ids(&self.node_ids);
+    }
+
+    fn snapshot_to_dir(&self, dir: &std::path::Path) -> std::io::Result<usize> {
+        self.graph.snapshot_to_dir(dir)
     }
 
     fn swap_out(&mut self, dir: &std::path::Path) -> std::io::Result<usize> {

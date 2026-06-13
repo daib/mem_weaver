@@ -27,23 +27,23 @@ spec:
               value: {{ .Values.env.LISTEN_ADDR | quote }}
             - name: DATA_DIR
               value: {{ .Values.env.DATA_DIR | quote }}
-            {{- if .Values.s3.enabled }}
-            - name: S3_BUCKET
-              value: {{ .Values.s3.bucket | quote }}
-            - name: S3_REGION
-              value: {{ .Values.s3.region | quote }}
-            - name: S3_PREFIX
-              value: {{ .Values.s3.prefix | quote }}
-            {{- if .Values.s3.secretName }}
+            {{- if .Values.blob.enabled }}
+            - name: BLOB_BUCKET
+              value: {{ .Values.blob.bucket | quote }}
+            - name: BLOB_REGION
+              value: {{ .Values.blob.region | quote }}
+            - name: BLOB_PREFIX
+              value: {{ .Values.blob.prefix | quote }}
+            {{- if .Values.blob.secretName }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.s3.secretName }}
+                  name: {{ .Values.blob.secretName }}
                   key: access-key-id
             - name: AWS_SECRET_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.s3.secretName }}
+                  name: {{ .Values.blob.secretName }}
                   key: secret-access-key
             {{- end }}
             {{- end }}

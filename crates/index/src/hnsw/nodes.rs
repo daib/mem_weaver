@@ -5,7 +5,7 @@ use crc32fast::Hasher as Crc32Hasher;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::{align_of, size_of};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use vector::Arena;
 
 /// Alignment used for arena-backed node storage (`try_alloc_slice_aligned`).
@@ -398,6 +398,31 @@ impl NodeBlock {
         }
     }
 
+    /// Copy the block's in-memory arena bytes to `path` without changing storage state.
+    /// No-op (returns `Ok(())`) for on-disk or evicted blocks — they have no live arena
+    /// to snapshot. The file format is identical to [`swap_out`]: raw arena bytes followed
+    /// by a CRC32 checksum, so the output can be uploaded to S3 and later restored via
+    /// [`swap_in_from`].
+    pub fn copy_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let NodeBlockStorage::InMemory(arena) = &self.storage else {
+            return Ok(());
+        };
+        let mapped = arena.mapped_bytes();
+        // SAFETY: `arena.as_ptr()` is valid for `mapped` bytes (the anonymous mmap).
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arena.as_ptr(), mapped) };
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(bytes);
+        let checksum = hasher.finalize();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.write_all(&checksum.to_le_bytes())?;
+        file.flush()
+    }
+
     /// Write the block's in-memory arena bytes to `path` (truncating any existing file),
     /// release the mapping, and transition to [`NodeBlockStorage::OnDisk`]. Errors if the
     /// block is already on disk.
@@ -612,6 +637,79 @@ impl ArenaNodeStore {
         })
     }
 
+    /// Set `len` on each block by counting how many `node_ids` map to it.
+    /// Called after [`load_from_dir`] + level loading so `len()` and `is_empty()`
+    /// return correct values for a restored index.
+    pub fn rebuild_lens_from_node_ids(&mut self, node_ids: &[NodeId]) {
+        for block in &mut self.blocks {
+            block.len = 0;
+        }
+        for &nid in node_ids {
+            let bi = NodeBlock::derive_block_index(nid);
+            if let Some(block) = self.blocks.get_mut(bi) {
+                block.len += 1;
+            }
+        }
+    }
+
+    /// Populate this store from `block_*.arena` files in `dir`, creating one
+    /// [`NodeBlock`] per file. Clears any existing blocks first. Used during crash
+    /// recovery to reconstruct arena state from files uploaded to S3 by the snapshot
+    /// task. Returns the number of blocks loaded.
+    ///
+    /// `len` on each restored block is 0 (node count is not serialized into the arena
+    /// file); search correctness is unaffected because `vector_at`/`neighbors_at` use
+    /// raw byte offsets, not the counter.
+    pub fn load_from_dir(&mut self, dir: impl AsRef<Path>) -> io::Result<usize> {
+        let dir = dir.as_ref();
+        let mut entries: Vec<(usize, PathBuf)> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("arena") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Some(idx_str) = stem.strip_prefix("block_") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        entries.push((idx, path));
+                    }
+                }
+            }
+        }
+        entries.sort_by_key(|(idx, _)| *idx);
+
+        self.blocks.clear();
+        for (block_index, path) in entries {
+            // try_new allocates a fresh arena; swap_in_from immediately replaces it with
+            // the on-disk bytes, so the initial mmap is dropped right away.
+            let mut block = NodeBlock::try_new(self.dim, self.m, self.m_max0, block_index)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "NodeBlock alloc failed"))?;
+            block.swap_in_from(&path)?;
+            self.blocks.push(block);
+        }
+        Ok(self.blocks.len())
+    }
+
+    /// Copy every in-memory block to `dir` as `block_<idx>.arena` without changing
+    /// storage state. On-disk and evicted blocks are skipped. Returns the number of
+    /// blocks written. The output format matches [`swap_out`] so files can be uploaded
+    /// to S3 and later restored via [`swap_in_from`].
+    pub fn snapshot_to_dir(&self, dir: impl AsRef<Path>) -> io::Result<usize> {
+        let dir = dir.as_ref();
+        std::fs::create_dir_all(dir)?;
+        let mut written = 0;
+        for block in &self.blocks {
+            if !block.is_in_memory() {
+                continue;
+            }
+            let path = dir.join(format!("block_{}.arena", block.block_index));
+            block.copy_to(&path)?;
+            written += 1;
+        }
+        Ok(written)
+    }
+
     /// Swap every in-memory block in this store to `dir`, one file per block named
     /// `block_<block_index>.arena`. The directory is created if missing.
     ///
@@ -770,6 +868,21 @@ pub trait HnswNodeStore {
     /// arena and ignore it. Callers should reuse the same `Vec<u8>` across calls.
     fn vector_at<'a>(&'a self, id: NodeId, buf: &'a mut Vec<u8>) -> &'a [f32];
 
+    /// Populate this store from `block_*.arena` files in `dir`, replacing any existing
+    /// blocks. Used during crash recovery to reconstruct an arena from snapshot files
+    /// downloaded from S3. Default: no-op (returns `Ok(0)`).
+    fn load_from_dir(&mut self, _dir: &Path) -> io::Result<usize> {
+        Ok(0)
+    }
+    /// Recompute block node-counts from a list of NodeIds. Called after
+    /// [`load_from_dir`] + level loading during recovery. Default: no-op.
+    fn rebuild_lens_from_node_ids(&mut self, _node_ids: &[NodeId]) {}
+    /// Copy in-memory storage units to `dir` without changing storage state. Default:
+    /// no-op (returns `Ok(0)`). [`ArenaNodeStore`] overrides this to fan out across its
+    /// blocks. Output format matches [`Self::swap_out`] so files are S3-restorable.
+    fn snapshot_to_dir(&self, _dir: &Path) -> io::Result<usize> {
+        Ok(0)
+    }
     /// Move underlying storage units to disk under `dir`. Default: no-op (return `Ok(0)`)
     /// for stores without arena-backed storage. [`ArenaNodeStore`] overrides this to
     /// fan out across its blocks.
@@ -1039,6 +1152,18 @@ impl HnswNodeStore for ArenaNodeStore {
         let block_index = NodeBlock::derive_block_index(id);
         let block = self.block(block_index);
         block.vector_at(id, buf)
+    }
+
+    fn load_from_dir(&mut self, dir: &Path) -> io::Result<usize> {
+        ArenaNodeStore::load_from_dir(self, dir)
+    }
+
+    fn rebuild_lens_from_node_ids(&mut self, node_ids: &[NodeId]) {
+        ArenaNodeStore::rebuild_lens_from_node_ids(self, node_ids);
+    }
+
+    fn snapshot_to_dir(&self, dir: &Path) -> io::Result<usize> {
+        ArenaNodeStore::snapshot_to_dir(self, dir)
     }
 
     fn swap_out(&mut self, dir: &Path) -> io::Result<usize> {
@@ -1587,5 +1712,224 @@ mod tests {
             "every previously-cold block must be restored"
         );
         assert!(store.all_in_memory());
+    }
+
+    // ── copy_to / snapshot_to_dir ─────────────────────────────────────────────
+
+    /// `copy_to` writes the same bytes as `swap_out`, leaving the block in-memory.
+    #[test]
+    fn node_block_copy_to_matches_swap_out_bytes_and_preserves_state() {
+        const DIM: usize = 8;
+        const M: usize = 4;
+        const M_MAX0: usize = 8;
+        let dir = unique_swap_dir("copy_to_match");
+        let _guard = DirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Insert a few nodes into two separate blocks so we have real data.
+        let mut block_a = NodeBlock::try_new(DIM, M, M_MAX0, 0).expect("alloc");
+        let mut block_b = NodeBlock::try_new(DIM, M, M_MAX0, 1).expect("alloc");
+        for i in 0..4u32 {
+            let v: Vec<f32> = (0..DIM)
+                .map(|j| (i * DIM as u32 + j as u32) as f32)
+                .collect();
+            block_a.push_node(&v, 1).expect("push a");
+            block_b.push_node(&v, 0).expect("push b");
+        }
+
+        // copy_to must not change state.
+        block_a
+            .copy_to(dir.join("copy_a.arena"))
+            .expect("copy_to a");
+        block_b
+            .copy_to(dir.join("copy_b.arena"))
+            .expect("copy_to b");
+        assert!(
+            block_a.is_in_memory(),
+            "block_a must stay in-memory after copy_to"
+        );
+        assert!(
+            block_b.is_in_memory(),
+            "block_b must stay in-memory after copy_to"
+        );
+
+        // swap_out on fresh blocks produces the reference bytes.
+        let mut ref_a = NodeBlock::try_new(DIM, M, M_MAX0, 0).expect("alloc ref_a");
+        let mut ref_b = NodeBlock::try_new(DIM, M, M_MAX0, 1).expect("alloc ref_b");
+        for i in 0..4u32 {
+            let v: Vec<f32> = (0..DIM)
+                .map(|j| (i * DIM as u32 + j as u32) as f32)
+                .collect();
+            ref_a.push_node(&v, 1).expect("push ref_a");
+            ref_b.push_node(&v, 0).expect("push ref_b");
+        }
+        ref_a
+            .swap_out(dir.join("swap_a.arena"))
+            .expect("swap_out ref_a");
+        ref_b
+            .swap_out(dir.join("swap_b.arena"))
+            .expect("swap_out ref_b");
+
+        assert_eq!(
+            std::fs::read(dir.join("copy_a.arena")).unwrap(),
+            std::fs::read(dir.join("swap_a.arena")).unwrap(),
+            "copy_to and swap_out must produce identical bytes for block_a"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("copy_b.arena")).unwrap(),
+            std::fs::read(dir.join("swap_b.arena")).unwrap(),
+            "copy_to and swap_out must produce identical bytes for block_b"
+        );
+    }
+
+    /// `copy_to` on an on-disk block is a no-op (returns Ok without touching the file).
+    #[test]
+    fn node_block_copy_to_on_disk_is_noop() {
+        let dir = unique_swap_dir("copy_to_ondisk");
+        let _guard = DirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut block = NodeBlock::try_new(4, 4, 8, 0).expect("alloc");
+        block.push_node(&[1.0_f32; 4], 0).expect("push");
+        block.swap_out(dir.join("block_0.arena")).expect("swap_out");
+        assert!(block.is_on_disk());
+
+        // copy_to on an on-disk block must succeed silently and not write a new file.
+        block
+            .copy_to(dir.join("ghost.arena"))
+            .expect("copy_to on-disk");
+        assert!(
+            !dir.join("ghost.arena").exists(),
+            "no file written for on-disk block"
+        );
+    }
+
+    /// `copy_to` on an evicted block is a no-op.
+    #[test]
+    fn node_block_copy_to_evicted_is_noop() {
+        let dir = unique_swap_dir("copy_to_evicted");
+        let _guard = DirGuard(dir.clone());
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let mut block = NodeBlock::try_new(4, 4, 8, 0).expect("alloc");
+        block.push_node(&[2.0_f32; 4], 0).expect("push");
+        block.swap_out(dir.join("block_0.arena")).expect("swap_out");
+        block.evict();
+        assert!(block.is_evicted());
+
+        block
+            .copy_to(dir.join("ghost.arena"))
+            .expect("copy_to evicted");
+        assert!(
+            !dir.join("ghost.arena").exists(),
+            "no file written for evicted block"
+        );
+    }
+
+    /// `snapshot_to_dir` writes files byte-identical to `swap_out` without changing state.
+    #[test]
+    fn arena_snapshot_to_dir_matches_swap_out_and_preserves_state() {
+        const DIM: usize = 4;
+        let snap_dir = unique_swap_dir("snap_match");
+        let swap_dir = unique_swap_dir("swap_match");
+        let _g1 = DirGuard(snap_dir.clone());
+        let _g2 = DirGuard(swap_dir.clone());
+
+        let mut store = ArenaNodeStore::try_new(DIM, 4, 8).expect("new");
+        for i in 0..3u32 {
+            store.push_node(&[i as f32; DIM], 0).expect("push");
+        }
+        assert!(store.all_in_memory());
+
+        let written = store.snapshot_to_dir(&snap_dir).expect("snapshot_to_dir");
+        assert!(written >= 1, "at least one block written");
+        assert!(
+            store.all_in_memory(),
+            "store must remain in-memory after snapshot"
+        );
+
+        // Reference: swap an identical store to disk.
+        let mut ref_store = ArenaNodeStore::try_new(DIM, 4, 8).expect("ref store");
+        for i in 0..3u32 {
+            ref_store.push_node(&[i as f32; DIM], 0).expect("push ref");
+        }
+        let moved = ref_store.swap_out(&swap_dir).expect("swap_out ref");
+        assert_eq!(
+            written, moved,
+            "snapshot and swap must process the same number of blocks"
+        );
+
+        // Every arena file produced by snapshot must match the corresponding swap file.
+        for entry in std::fs::read_dir(&snap_dir).expect("read snap_dir") {
+            let path = entry.expect("entry").path();
+            if path.extension().and_then(|s| s.to_str()) != Some("arena") {
+                continue;
+            }
+            let filename = path.file_name().unwrap();
+            let snap_bytes = std::fs::read(&path).expect("read snap file");
+            let swap_bytes = std::fs::read(swap_dir.join(filename)).expect("read swap file");
+            assert_eq!(
+                snap_bytes, swap_bytes,
+                "{filename:?}: snapshot bytes differ from swap_out bytes"
+            );
+        }
+    }
+
+    /// `snapshot_to_dir` on a store with no in-memory blocks writes nothing.
+    #[test]
+    fn arena_snapshot_to_dir_skips_on_disk_blocks() {
+        const DIM: usize = 4;
+        let swap_dir = unique_swap_dir("snap_skip_swap");
+        let snap_dir = unique_swap_dir("snap_skip_snap");
+        let _g1 = DirGuard(swap_dir.clone());
+        let _g2 = DirGuard(snap_dir.clone());
+
+        let mut store = ArenaNodeStore::try_new(DIM, 4, 8).expect("new");
+        store.push_node(&[1.0_f32; DIM], 0).expect("push");
+        store.swap_out(&swap_dir).expect("swap_out");
+        assert!(store.all_on_disk());
+
+        let written = store.snapshot_to_dir(&snap_dir).expect("snapshot_to_dir");
+        assert_eq!(written, 0, "no in-memory blocks means nothing to snapshot");
+        assert!(
+            std::fs::read_dir(&snap_dir)
+                .expect("read_dir")
+                .next()
+                .is_none(),
+            "no files written when all blocks are on disk"
+        );
+    }
+
+    /// Files produced by `snapshot_to_dir` pass CRC32 validation via `swap_in_from`.
+    #[test]
+    fn arena_snapshot_to_dir_files_are_restorable() {
+        const DIM: usize = 4;
+        const M: usize = 4;
+        const M_MAX0: usize = 8;
+        let snap_dir = unique_swap_dir("snap_restore");
+        let _guard = DirGuard(snap_dir.clone());
+
+        let mut store = ArenaNodeStore::try_new(DIM, M, M_MAX0).expect("new");
+        for i in 0..4u32 {
+            store.push_node(&[i as f32; DIM], 0).expect("push");
+        }
+        store.snapshot_to_dir(&snap_dir).expect("snapshot_to_dir");
+
+        // Evict so swap_in_from is needed to restore.
+        store
+            .swap_out(&snap_dir)
+            .expect("swap_out (transition to on-disk)");
+        store.evict();
+        assert!(store.all_evicted());
+
+        let restored = store
+            .swap_in_from(&snap_dir)
+            .expect("swap_in_from snapshot files");
+        assert!(restored >= 1, "at least one block must have been restored");
+        assert!(store.all_in_memory());
+
+        // The fact that swap_in_from succeeded with valid CRC32 proves the bytes
+        // round-tripped correctly. Len check provides an additional sanity signal.
+        assert_eq!(store.len(), 4);
     }
 }

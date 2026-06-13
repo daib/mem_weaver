@@ -1,58 +1,67 @@
 # MemWeaver
 
-A vector database built for workloads where time is a first-class search dimension. Memory cost is known before deployment, not discovered in production.
+A temporal vector database with predictable memory usage. Memory cost is a function of vectors, dimensions, and M — known before deployment, not discovered in production.
 
 ```
-memory = hot_bucket_count × (n_vectors × node_size)
+memory ≈ n × node_size
 ```
 
-For dim=128, M=16: `node_size = 640 bytes`. 1M vectors in 4 hot buckets = **2.56 GB**, calculable before any data is inserted.
-
----
-
-## When to Use MemWeaver
-
-MemWeaver is designed for content that ages — where recent data is more relevant than old data, and memory cost must be predictable at scale.
-
-**Good fit:**
-
-**News and content feeds** — Find similar articles weighted by recency. Recent articles matter more than archived ones. Hot tier: today's content. Cold tier: archives on disk or S3.
-
-**Document search** — Find relevant docs that are actually current. Old architecture docs and recent RFCs should rank differently. Confluence search is terrible partly because it treats a 5-year-old doc the same as one updated last week.
-
-**Code search** — Find recent examples of patterns in your codebase. New implementations ranked above deprecated ones. "How do we handle auth now" should return this year's code, not 2019's.
-
-**Financial and research signals** — Time-window queries: find events similar to this one in the 24 hours before that incident. Temporal precision matters.
-
-**Not a good fit:**
-
-- **AI conversation memory** — collections are small (hundreds to thousands of vectors per user). Use pgvector with a timestamp filter and flat search.
-- **High-volume log embedding** — embedding every log line at production ingestion rates is cost-prohibitive. Use structured search for logs.
-- **Static collections** — no temporal relevance, no hot/cold tiering needed. pgvector is simpler and sufficient.
+For dim=128, M=16: `node_size = 640 bytes`, so 1M vectors requires approximately **640 MB** — calculable before any data is inserted.
 
 ---
 
 ## Why MemWeaver
 
-Every production vector database has the same operational problem: you cannot know your memory cost before you deploy. You provision generously, monitor closely, and scale reactively.
+Most vector databases have two operational problems:
 
-MemWeaver is designed around the opposite principle: **memory is a first-class design constraint, not a runtime surprise**.
+**Memory is unpredictable.** You cannot know your memory cost before you deploy. You provision generously, monitor closely, and scale reactively.
 
-The hot/cold tiering model enforces this explicitly. Cold buckets cost zero RAM. You control exactly what stays hot. No OS page cache surprises, no implicit promotion, no "it depends on query patterns" footnote.
+**Search is temporally blind.** A document from last week and a document from three years ago are treated identically. Recency is either ignored or handled by timestamp filters that don't affect ranking.
 
-**pgvector doesn't know what year it is. MemWeaver does.**
+MemWeaver is designed around two opposite principles:
 
-See [DESIGN.md](DESIGN.md) for the full technical motivation.
+- **Memory is a first-class design constraint**, not a runtime surprise.
+- **Time is a first-class dimension of relevance**, not a filter applied after the fact.
+
+---
+
+## Radar — Built on MemWeaver
+
+Radar is a semantic knowledge search system built on MemWeaver, indexing articles from RSS feeds and Common Crawl with temporal relevance.
+
+Search query: `"startup funding"`
+
+![Radar search results showing semantic search over crawled articles](docs/radar_search.png)
+
+Recent articles surface naturally ahead of older ones. No explicit timestamp filtering — temporal relevance is structural, not bolted on.
+
+### Radar Pipeline
+
+```
+RSS feeds / Common Crawl CDX
+        ↓
+  FetchArticlesFromRSS / FetchArticlesForDomain
+        ↓
+  EmbedBatch (embed-svc — sentence-transformers)
+        ↓
+  StoreText → Postgres (metadata) + local disk (article bodies)
+        ↓
+  BatchInsertMemWeaver (HNSW vector index)
+        ↓
+  Search API → UI
+```
+
+Each stage is an independent Temporal activity — crash-safe, retriable, observable. Text storage is outside MemWeaver; the search API returns `vector_id` values resolved against Postgres metadata.
 
 ---
 
 ## Benchmarks
 
-### Arena vs Naive: Build and Search Performance
-
 Evaluated on AWS m5d.4xlarge (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) using the [SIFT1M](http://corpus-texmex.irisa.fr/) dataset (1M vectors, dim=128).
 
 **Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10, 50 search queries. Compiled with `target-cpu=native`.
+
+### Build and search performance
 
 | Implementation | Build time | Search (50 queries) | Speedup |
 |---|---|---|---|
@@ -61,107 +70,130 @@ Evaluated on AWS m5d.4xlarge (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) using th
 
 Arena allocation is **1.72x faster** to build and **1.71x faster** to query due to cache locality — collocating each vector with its HNSW edges means graph traversal accesses contiguous memory.
 
-### Memory Predictability
+### Memory predictability
 
-The arena implementation maintains a **constant ~8 MB peak overhead** throughout 1M vector insertion. The naive Vec-based implementation shows reallocation spikes of 21.6 MB at 270k vectors and 35.7 MB at 530k vectors as the underlying buffer doubles capacity.
+The arena implementation maintains a **constant ~8 MB peak overhead** throughout 1M vector insertion. The naive Vec-based implementation shows reallocation spikes of 21.6 MB at 270k vectors and 35.7 MB at 530k vectors.
 
 The arena implementation also uses **25% less total RSS** at 1M vectors (608 MB growth vs 759 MB).
 
-![Memory comparison](docs/memory_comparison.png)
+![Memory comparison chart](docs/memory_comparison.png)
 
 ---
 
-### TimeBucket: Temporal Partitioning
+## Temporal Architecture
 
-TimeBucket partitions the HNSW index across time windows. Each bucket maintains an independent HNSW graph. Queries search across relevant buckets and merge results with optional recency weighting.
+MemWeaver partitions vectors into time buckets. Recent vectors live in hot buckets (in-memory HNSW). Older vectors are demoted to cold buckets (disk or S3).
 
-**Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10, 1000 queries, SIFT1M (1M vectors, dim=128), Apple M-series, StdRng.
+```
+Hot buckets (RAM):    recent vectors, fast HNSW search
+Cold buckets (disk):  older vectors, on-demand search
+S3 cold tier:         archived buckets, restored on demand
+```
 
-#### Build and Query Tradeoffs
+Search spans all buckets. Results are merged and re-ranked with recency weighting — vectors in recent buckets score higher for equivalent semantic distance.
 
-| Buckets | Vectors/bucket | Build time | HNSW search (1000q) | Mean recall@10 | P95 recall | Build speedup |
-|---------|---------------|-----------|---------------------|----------------|------------|---------------|
-| n=1 (baseline) | 1,000,000 | 156s | 523ms | 0.959 | 1.000 | 1.0x |
-| n=4 | 250,000 | 110s | 1,102ms | 0.905 | 1.000 | 1.42x |
-| n=8 | 125,000 | 84s | 2,028ms | 0.940 | 1.000 | 1.86x |
-| n=16 | 62,500 | 62s | 3,477ms | 0.949 | 1.000 | 2.52x |
-
-- **Build time scales sublinearly** — 2.52x faster at n=16 with comparable recall
-- **P95 recall = 1.0 across all configurations** — 95% of queries return perfect recall
-- **Mean recall differences are within noise** — bucket count does not meaningfully degrade recall
-- **Query time scales linearly** — expected tradeoff for searching N independent graphs
-
-#### Hot/Cold Tier Performance
-
-MemWeaver supports explicit hot/cold tiering. Buckets are swapped to disk atomically — memory freed immediately on swap-out, fully restored on swap-in. No OS page cache involvement.
-
-**n=8 buckets, 1M vectors, 1000 queries, Apple M-series SSD:**
-
-| State | HNSW search (1000q) | Mean recall | Min recall | Operation time |
-|-------|---------------------|-------------|------------|----------------|
-| Hot (in memory) | 2,028ms | 0.9396 | 0.40 | — |
-| Cold (disk reads) | 10,696ms | 0.9396 | 0.40 | swap out: 130ms |
-| Restored (hot again) | 2,017ms | 0.9396 | 0.40 | swap in: 120ms |
-
-- **Recall is identical across all three states** — tiering is a pure performance/memory tradeoff with zero correctness cost
-- **Cold queries are 5.3x slower** on Mac SSD — significantly better on NVMe in production
-- **Swap operations are fast** — 130ms to swap 8 buckets out, 120ms to restore
-- **Memory accounting is exact** — `hot_buckets × bucket_size`, cold buckets cost zero RAM
-
-#### RNG Matters at Scale
-
-Using `SmallRng` instead of `StdRng` at 1M vectors produces severely degraded results. **Always use `StdRng`** for production workloads.
-
-| RNG | Mean recall | Min recall |
-|-----|-------------|------------|
-| StdRng | 0.959 | 0.40 |
-| SmallRng | 0.799 | 0.00 |
-
----
-
-## Hot/Cold Tier Design
-
-MemWeaver's tiering is explicit and predictable by design. Unlike mmap-based approaches where the OS decides what stays resident, MemWeaver gives you full control:
+### Hot/Cold Tiering
 
 ```rust
-// Swap a bucket to disk — memory freed immediately
-index.swap_out(bucket_seq)?;
+// Demote a bucket to disk
+index.swap_out(bucket_seq).await?;
 
-// Restore a bucket — identical search quality guaranteed
-index.swap_in(bucket_seq)?;
+// Restore from disk for search
+index.swap_in(bucket_seq).await?;
 
-// Query cold buckets directly without swapping in
-// Temporary file read for query duration only
-index.search_including_cold(query, k, ef)?;
+// Recall is identical after swap cycle — bit-perfect restore validated
 ```
 
-The memory guarantee holds unconditionally:
+Bit-perfect restore is validated: recall is identical before and after a hot→cold→hot cycle.
+
+### S3 Cold Tier
+
+Cold buckets can be archived to S3 (or GCS, Azure Blob via `object_store`). On search, cold buckets are temporarily read from object storage without full restoration.
 
 ```
-memory = hot_bucket_count × (n_vectors × node_size)
-       + active_cold_queries × ~640KB  // pages touched during traversal
+s3://your-bucket/
+└── collections/
+    └── {collection}/
+        └── seq_{n}/
+            ├── arena_{n}.bin     ← arena snapshot
+            ├── levels.bin        ← node metadata
+            ├── manifest.json     ← bucket state
+            └── wal/
+                └── vectors_{timestamp}.bin  ← WAL for crash recovery
 ```
 
-This is different from every vector database that uses persistent mmap and calls it "efficient memory usage." Those systems depend on OS page cache behavior. MemWeaver's memory cost is calculable before deployment.
+---
+
+## Horizontal Scaling
+
+MemWeaver scales along two dimensions:
+
+**Collection sharding (write scaling):**
+
+Large collections are partitioned across nodes. Each node owns a subset of time buckets. Consistent hashing routes inserts to the correct shard. Search results are merged and re-ranked at query time across shards.
+
+**Stateless reader nodes (read scaling):**
+
+Cold buckets are served from S3 by any reader node — no local state required. S3 is the source of truth. Adding reader nodes scales search throughput linearly. Hot buckets are replicated to reader nodes on demand.
+
+```
+                    ┌─────────────┐
+                    │  Search API │
+                    └──────┬──────┘
+                           │
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+        ┌──────────┐ ┌──────────┐ ┌──────────┐
+        │ Reader 0 │ │ Reader 1 │ │ Reader N │  ← stateless, S3-backed
+        └──────────┘ └──────────┘ └──────────┘
+              │            │            │
+              └────────────┼────────────┘
+                           ▼
+                    ┌─────────────┐
+                    │     S3      │  ← source of truth for cold tier
+                    └─────────────┘
+```
+
+This is currently in progress — see [Current Status](#current-status).
+
+---
+
+## gRPC API
+
+```protobuf
+service MemWeaver {
+  rpc BatchInsert(BatchInsertRequest) returns (BatchInsertResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse);
+}
+
+message InsertItem {
+  repeated float vector    = 1;
+  uint64         timestamp = 2;  // unix nanoseconds
+  uint64         vector_id = 3;  // caller-assigned
+}
+
+message SearchRequest {
+  repeated float  query            = 1;
+  uint32          k                = 2;
+  uint32          ef               = 3;
+  optional uint64 time_range_start = 4;  // optional temporal filter
+  optional uint64 time_range_end   = 5;
+}
+
+message SearchHit {
+  uint64 vector_id = 1;  // caller resolves to text via their own store
+  float  distance  = 2;
+}
+```
+
+MemWeaver returns `vector_id` values. Text storage is the caller's responsibility — use Postgres, SQLite, Cassandra, or S3 depending on your scale. This keeps MemWeaver focused and composable with infrastructure you already run.
 
 ---
 
 ## Arena Design
 
-### The problem with naive HNSW storage
-
-A naive implementation stores vectors and edges in separate growable arrays:
-
-```rust
-struct HnswNaive {
-    nodes: Vec<Vec<Vec<NodeId>>>,  // layers × neighbors per node
-    vectors: Vec<Vec<f32>>,
-}
-```
-
-This causes repeated reallocation as data grows — temporarily doubling memory usage, creating fragmentation, and separating vector data from edge data causing cache misses during graph traversal.
-
-### Collocated arena layout
+### Collocated node layout
 
 MemWeaver stores each vector adjacent to its HNSW edges in a single arena block:
 
@@ -169,27 +201,30 @@ MemWeaver stores each vector adjacent to its HNSW edges in a single arena block:
 [ vector_1 | edges_1 | vector_2 | edges_2 | ... | vector_n | edges_n ]
 ```
 
-Each `(vector, edges)` pair is a **Node**. Nodes within one arena form a **NodeBlock**:
-
-```rust
-struct HnswArena {
-    blocks: Vec<NodeBlock>,
-}
-```
+Cache locality during graph traversal: accessing a node's vector and its edges is a single cache line read.
 
 ### NodeId encoding
-
-Both block index and offset are encoded directly into the 32-bit NodeId:
 
 ```
 NodeId (u32): [ block_index: 14 bits | offset >> 3: 18 bits ]
 ```
 
-- Arena size: 2MB. Requires 21 bits to address all offsets.
-- 8-byte alignment: bottom 3 bits always 0, saving 3 bits.
-- Result: 18 bits offset, 14 bits block index → **32 GB addressable**.
+- Arena size: 2MB. 8-byte alignment saves 3 bits.
+- Result: 14 bits block index + 18 bits offset → **32 GB addressable**.
+- Node lookup: two pointer hops (block array + offset arithmetic).
 
-This encoding reduces node lookup to **two pointer hops** versus three in a naive approach.
+### Alignment
+
+For typical configurations, node sizes are naturally cache-line aligned:
+
+```
+dim=128, M=16:
+  node_size = 512 (vector) + 128 (edges) = 640 bytes = 64 × 10 ✓
+```
+
+### max_layer storage
+
+`max_level` per node is stored in `levels.bin` alongside `vector_id`, not collocated in the arena. It is not on the critical path during HNSW traversal. This keeps node size a clean multiple of 64 bytes and enables efficient cold storage.
 
 ### Predictable memory formula
 
@@ -203,20 +238,12 @@ For dim=128, M=16, M_MAX0=32:
 
 ```
 node_size ≈ 640 bytes
-1M vectors  ≈ 640 MB
+1M vectors ≈ 640 MB
 10M vectors ≈ 6.4 GB
 100M vectors ≈ 64 GB
 ```
 
----
-
-## Durability
-
-MemWeaver is a search index, not a primary store. Vectors should live in durable upstream storage — Kafka, Cassandra, S3, or similar.
-
-On crash recovery, MemWeaver replays from the last committed upstream offset. Cold buckets on disk are recovered from the manifest. Hot buckets are rebuilt from the upstream source.
-
-For small deployments without a durable upstream, a built-in WAL provides single-node crash recovery.
+Known before deployment. Not discovered in production.
 
 ---
 
@@ -227,20 +254,20 @@ For small deployments without a durable upstream, a built-in WAL provides single
 wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 tar -xzf sift.tar.gz
 
-# Set dataset path
 export SIFT1M_BASE_PATH=/path/to/sift
 
-# Arena vs naive
+# Run benchmarks
+RUSTFLAGS="-C target-cpu=native" cargo test --release
+
+# Arena only
 SIFT1M_HNSW_BENCH_VARIANT=arena SIFT1M_HNSW_BENCH_SAMPLE_SIZE=1 \
   cargo bench -p index --bench hnsw_sift1m 2> arena.txt
 
+# Naive only
 SIFT1M_HNSW_BENCH_VARIANT=naive SIFT1M_HNSW_BENCH_SAMPLE_SIZE=1 \
   cargo bench -p index --bench hnsw_sift1m 2> naive.txt
 
-# TimeBucket recall + hot/cold/restore benchmark
-cargo test --release -p index --test sift1m_time_bucket_recall
-
-# Memory comparison chart
+# Generate memory comparison chart
 python3 scripts/plot_memory.py arena.txt naive.txt
 ```
 
@@ -248,25 +275,46 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 
 ## Current Status
 
+**Core index:**
 - [x] HNSW index with arena allocator
 - [x] Collocated node layout (vector + edges)
 - [x] NodeId encoding for O(1) node lookup
 - [x] SIMD distance computation (AVX2/AVX-512 via `wide` crate)
 - [x] Benchmarked on SIFT1M
-- [x] Time-bucketed multi-HNSW for temporal relevance
+
+**Temporal relevance:**
+- [x] Time-bucketed multi-HNSW
 - [x] Configurable aging policy
 - [x] Recency-weighted search with pluggable distance adjustment
+
+**Hot/cold tiering:**
 - [x] Explicit hot/cold tiering — swap_out / swap_in
 - [x] Bit-perfect restore — identical recall after swap cycle
 - [x] Cold bucket search via temporary file read
 - [x] S3/GCS/Azure cold tier via `object_store`
-- [x] Store metadata
-- [ ] Memory controller — automatic eviction policy
-- [ ] Crash recovery from S3
-- [ ] pgvector comparison benchmarks
+
+**Persistence:**
+- [x] Metadata storage (levels.bin, manifest.json)
+- [ ] Crash recovery from S3 (WAL + snapshot)
+- [ ] Differential arena uploads (dirty tracking)
+
+**API:**
+- [x] gRPC API (BatchInsert, Search, CreateCollection)
+
+**Performance:**
 - [ ] Parallel index construction (level-lock pipelining)
-- [ ] Per-cluster HNSW for reader node cold tier
-- [ ] Stateless reader nodes for horizontal read scaling
+- [ ] Memory controller — automatic eviction policy
+
+**Cold tier optimization:**
+- [ ] HNSW → IVF conversion at bucket seal time
+- [ ] Per-cluster HNSW for cold tier reader nodes
+
+**Scale:**
+- [ ] Collection sharding across nodes (write scaling)
+- [ ] Stateless reader nodes for horizontal read scaling (S3-backed)
+
+**Benchmarks:**
+- [ ] pgvector comparison benchmarks
 
 ---
 

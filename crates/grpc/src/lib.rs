@@ -6,13 +6,27 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{top_k_quickselect, Timestamp};
-use index::{download_arena_dir, download_levels, download_manifest};
-use index::{upload_arena_dir, upload_levels, upload_manifest};
-use index::{BucketSeq, TimeBucketIndex};
+use index::{
+    delete_prefix, BucketMeta, BucketSeq, Catalog, CatalogEntry, CollectionMeta, TimeBucketIndex,
+};
+use index::{
+    download_arena_dir, download_bucket_meta, download_catalog, download_collection_meta,
+    download_levels, download_manifest,
+};
+use index::{
+    upload_arena_dir, upload_bucket_meta, upload_catalog, upload_collection_meta, upload_levels,
+    upload_manifest,
+};
 use object_store::{path::Path as ObjectPath, ObjectStore};
 use rand::{rngs::StdRng, SeedableRng};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
+
+/// Configuration for the periodic arena snapshot task.
+pub struct SnapshotConfig {
+    /// How often to take a snapshot of every in-memory bucket across all collections.
+    pub interval: Duration,
+}
 
 pub mod proto {
     tonic::include_proto!("mem_weaver.v1");
@@ -36,11 +50,11 @@ pub struct MemWeaverService {
     /// Base directory for on-disk bucket files. Bucket `seq` of collection `c` is stored
     /// under `<data_dir>/<c>/seq_<seq>/`.
     data_dir: PathBuf,
-    /// Optional S3 (or compatible) store for blob operations.
+    /// Optional blob store (S3-compatible).
     store: Option<Arc<dyn ObjectStore>>,
-    /// Base S3 prefix. Bucket `seq` of collection `c` lives at
-    /// `<s3_prefix>/<c>/seq_<seq>/`.
-    s3_prefix: ObjectPath,
+    /// Base blob prefix. Bucket `seq` of collection `c` lives at
+    /// `<blob_prefix>/<c>/seq_<seq>/`.
+    blob_prefix: ObjectPath,
 }
 
 impl MemWeaverService {
@@ -49,20 +63,50 @@ impl MemWeaverService {
             collections: Arc::new(RwLock::new(HashMap::new())),
             data_dir: PathBuf::from("./data"),
             store: None,
-            s3_prefix: ObjectPath::from("mem-weaver"),
+            blob_prefix: ObjectPath::from("mem-weaver"),
         }
+    }
+
+    /// Returns the number of in-memory collections. Useful for testing recovery.
+    pub async fn collection_count(&self) -> usize {
+        self.collections.read().await.len()
+    }
+
+    /// Returns `true` if a collection with `name` exists in memory.
+    pub async fn has_collection(&self, name: &str) -> bool {
+        self.collections.read().await.contains_key(name)
+    }
+
+    /// Returns the number of buckets in collection `name`, or `None` if the collection
+    /// does not exist.
+    pub async fn bucket_count(&self, name: &str) -> Option<usize> {
+        let col = self.collections.read().await.get(name).cloned()?;
+        let n = col.read().await.bucket_count();
+        Some(n)
+    }
+
+    /// Permanently drop the oldest bucket from `name`'s index (delegates to
+    /// [`TimeBucketIndex::evict_oldest`]). Returns `false` if the collection does
+    /// not exist or has no buckets. Intended for TTL-style bucket management and tests.
+    pub async fn evict_oldest_bucket(&self, name: &str) -> bool {
+        let col = match self.collections.read().await.get(name).cloned() {
+            Some(c) => c,
+            None => return false,
+        };
+        let found = col.write().await.evict_oldest().is_some();
+        found
     }
 
     pub fn with_storage(
         data_dir: impl Into<PathBuf>,
         store: Option<Arc<dyn ObjectStore>>,
-        s3_prefix: impl Into<String>,
+        blob_prefix: impl Into<String>,
     ) -> Self {
         Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
             data_dir: data_dir.into(),
             store,
-            s3_prefix: ObjectPath::from(s3_prefix.into()),
+            blob_prefix: ObjectPath::from(blob_prefix.into()),
         }
     }
 
@@ -70,14 +114,400 @@ impl MemWeaverService {
         self.data_dir.join(collection).join(format!("seq_{seq}"))
     }
 
-    fn bucket_s3_prefix(&self, collection: &str, seq: u32) -> ObjectPath {
-        self.s3_prefix.child(collection).child(format!("seq_{seq}"))
+    fn bucket_blob_prefix(&self, collection: &str, seq: u32) -> ObjectPath {
+        self.blob_prefix
+            .child(collection)
+            .child(format!("seq_{seq}"))
     }
 }
 
 impl Default for MemWeaverService {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl MemWeaverService {
+    /// Spawn a background task that periodically snapshots every in-memory bucket to S3.
+    ///
+    /// Each snapshot cycle: for every collection and every bucket, arena blocks are copied
+    /// to a temporary local directory (under `<data_dir>/<collection>/snap_<seq>/`), then
+    /// uploaded to `<blob_prefix>/<collection>/seq_<seq>/` in the configured object store.
+    /// The local copy is removed after a successful upload. Storage state is never changed —
+    /// in-memory arenas stay in memory and search keeps working throughout.
+    ///
+    /// Returns `None` if no object store is configured (S3 must be set up via
+    /// [`MemWeaverService::with_storage`]).
+    pub fn spawn_snapshot_task(
+        &self,
+        config: SnapshotConfig,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let store = self.store.clone()?;
+        let collections = Arc::clone(&self.collections);
+        let data_dir = self.data_dir.clone();
+        let blob_prefix = self.blob_prefix.clone();
+
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(config.interval).await;
+
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                // Snapshot each collection under a read lock so inserts are never blocked.
+                let col_map: Vec<(String, Arc<RwLock<TimeBucketIndex>>)> = collections
+                    .read()
+                    .await
+                    .iter()
+                    .map(|(name, col)| (name.clone(), Arc::clone(col)))
+                    .collect();
+
+                for (col_name, col) in col_map {
+                    let col_prefix = blob_prefix.child(col_name.as_str());
+
+                    // Read config and bucket list under a single read lock.
+                    let (col_config, bucket_metas) = {
+                        let idx = col.read().await;
+                        (idx.config(), idx.bucket_metas())
+                    };
+
+                    // Upload collection.json so recovery knows the index parameters.
+                    let (dim, m, m_max0, ef_construction, bucket_duration) = col_config;
+                    let col_meta = CollectionMeta {
+                        version: 1,
+                        dim,
+                        m,
+                        m_max0,
+                        ef_construction,
+                        bucket_duration_secs: bucket_duration.as_secs(),
+                        snapshot_at_secs: now_secs,
+                    };
+                    if let Err(e) =
+                        upload_collection_meta(store.as_ref(), &col_meta, &col_prefix).await
+                    {
+                        eprintln!("snapshot: {col_name}: collection.json upload failed: {e}");
+                    }
+
+                    // Track seqs that were successfully committed this cycle so we
+                    // can delete S3 prefixes for buckets that are no longer live.
+                    let mut committed: std::collections::HashSet<u32> =
+                        std::collections::HashSet::new();
+
+                    for (seq, created_at) in &bucket_metas {
+                        let seq = *seq;
+                        let created_at = *created_at;
+                        let snap_dir = data_dir.join(&col_name).join(format!("snap_{}", seq.0));
+                        let bucket_prefix = col_prefix.child(format!("seq_{}", seq.0));
+
+                        // Write arena files + levels + manifest to a temp local dir.
+                        let snapped = {
+                            let idx = col.read().await;
+                            idx.snapshot_bucket(seq, &snap_dir)
+                        };
+
+                        match snapped {
+                            // Evicted with local files gone: already in blob storage, still live.
+                            Ok(false) => {
+                                committed.insert(seq.0);
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "snapshot: {col_name}/seq_{}: disk write failed: {e}",
+                                    seq.0
+                                );
+                                let _ = std::fs::remove_dir_all(&snap_dir);
+                                continue;
+                            }
+                            Ok(true) => {}
+                        }
+
+                        // Stage files in a versioned subdirectory so the current
+                        // complete snapshot is never partially overwritten.
+                        // Layout: seq_<N>/snap_<T>/{block_*.arena, levels.bin, manifest.json}
+                        // Commit: seq_<N>/bucket_meta.json points to snap_<T>.
+                        let snap_subdir = format!("snap_{now_secs}");
+                        let staged_prefix = bucket_prefix.child(snap_subdir.as_str());
+
+                        let bucket_meta = BucketMeta {
+                            version: 1,
+                            seq: seq.0,
+                            created_at_secs: created_at.0,
+                            snap_dir: snap_subdir.clone(),
+                        };
+                        let upload = async {
+                            // Upload all content files to the staged prefix.
+                            upload_arena_dir(store.as_ref(), &snap_dir, &staged_prefix).await?;
+                            upload_levels(
+                                store.as_ref(),
+                                &snap_dir.join("levels.bin"),
+                                &staged_prefix,
+                            )
+                            .await?;
+                            upload_manifest(
+                                store.as_ref(),
+                                &snap_dir.join("manifest.json"),
+                                &staged_prefix,
+                            )
+                            .await?;
+                            // Atomic commit: write bucket_meta.json at seq_<N>/ pointing
+                            // to the new staged prefix. The old snapshot is still intact
+                            // until this PUT succeeds.
+                            upload_bucket_meta(store.as_ref(), &bucket_meta, &bucket_prefix).await
+                        };
+                        match upload.await {
+                            Ok(()) => {
+                                committed.insert(seq.0);
+                                // Clean up any old snap_* dirs in this bucket prefix that
+                                // are no longer the active snapshot.
+                                if let Ok(listing) =
+                                    store.list_with_delimiter(Some(&bucket_prefix)).await
+                                {
+                                    for old in listing.common_prefixes {
+                                        let name =
+                                            old.parts().last().map(|p| p.as_ref().to_owned());
+                                        if let Some(name) = name {
+                                            if name != snap_subdir && name.starts_with("snap_") {
+                                                let _ = delete_prefix(store.as_ref(), &old).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!(
+                                "snapshot: {col_name}/seq_{}: blob upload failed: {e}",
+                                seq.0
+                            ),
+                        }
+
+                        let _ = std::fs::remove_dir_all(&snap_dir);
+                    }
+
+                    // Delete any blob-prefix that belongs to a bucket no longer in the
+                    // index (evicted via evict_oldest / evict_before). We only do this
+                    // when the full cycle completed without skipping any live buckets, to
+                    // avoid deleting data that failed to re-upload this cycle.
+                    let live_seqs: std::collections::HashSet<u32> =
+                        bucket_metas.iter().map(|(s, _)| s.0).collect();
+                    if committed == live_seqs {
+                        // List all seq_*/ prefixes in blob storage for this collection.
+                        let listed = store.list_with_delimiter(Some(&col_prefix)).await;
+                        match listed {
+                            Err(e) => eprintln!(
+                                "snapshot: {col_name}: failed to list blob prefixes for cleanup: {e}"
+                            ),
+                            Ok(result) => {
+                                for stale_prefix in result.common_prefixes {
+                                    // Extract seq number from "seq_N" path component.
+                                    let last = stale_prefix
+                                        .parts()
+                                        .last()
+                                        .map(|p| p.as_ref().to_owned());
+                                    let seq_num = last
+                                        .as_deref()
+                                        .and_then(|s| s.strip_prefix("seq_"))
+                                        .and_then(|s| s.parse::<u32>().ok());
+                                    let Some(seq_num) = seq_num else { continue };
+                                    if !live_seqs.contains(&seq_num) {
+                                        match delete_prefix(store.as_ref(), &stale_prefix).await {
+                                            Ok(n) => eprintln!(
+                                                "snapshot: {col_name}/seq_{seq_num}: deleted {n} stale object(s)"
+                                            ),
+                                            Err(e) => eprintln!(
+                                                "snapshot: {col_name}/seq_{seq_num}: stale prefix delete failed: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Restore all collections from the most recent snapshots in S3.
+    ///
+    /// Called once at startup (before the gRPC server begins accepting requests) to
+    /// recover from a crash. For each collection found under `blob_prefix`:
+    /// 1. `collection.json` is read to obtain index configuration.
+    /// 2. Every `seq_<N>/` prefix is scanned for `bucket_meta.json`.
+    /// 3. Arena blocks, `levels.bin`, and `manifest.json` are downloaded for each bucket.
+    /// 4. The collection is reconstructed in memory with buckets sorted oldest-first.
+    ///
+    /// Buckets that fail to restore (corrupt data, missing files) are skipped with a
+    /// warning. Returns an error only if listing blob storage fails at the top level. Collections
+    /// that already exist in memory are not overwritten.
+    ///
+    /// Returns `Ok(())` immediately if no object store is configured.
+    pub async fn recover_from_snapshots(&self) -> std::io::Result<()> {
+        let store = match &self.store {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+
+        // Use the catalog to discover which collections to restore. It carries both the
+        // collection names and their index configs — no per-collection blob read needed.
+        //
+        // If no catalog exists yet (first boot, or a node that pre-dates the catalog)
+        // fall back to listing all prefixes and downloading each collection.json.
+        let collection_entries: Vec<CatalogEntry> =
+            match download_catalog(store.as_ref(), &self.blob_prefix).await {
+                Ok(catalog) => {
+                    eprintln!(
+                        "recovery: catalog found ({} collection(s))",
+                        catalog.collections.len()
+                    );
+                    catalog.collections
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!("recovery: no catalog found, scanning all blob prefixes");
+                    let list = store
+                        .list_with_delimiter(Some(&self.blob_prefix))
+                        .await
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    let mut entries = Vec::new();
+                    for col_prefix in list.common_prefixes {
+                        let col_name =
+                            match col_prefix.parts().last().map(|s| s.as_ref().to_owned()) {
+                                Some(n) if !n.is_empty() => n,
+                                _ => continue,
+                            };
+                        match download_collection_meta(store.as_ref(), &col_prefix).await {
+                            Ok(m) => entries.push(CatalogEntry {
+                                name: col_name,
+                                dim: m.dim,
+                                m: m.m,
+                                m_max0: m.m_max0,
+                                ef_construction: m.ef_construction,
+                                bucket_duration_secs: m.bucket_duration_secs,
+                                snapshot_at_secs: m.snapshot_at_secs,
+                            }),
+                            Err(e) => eprintln!("recovery: {col_name}: collection.json error: {e}"),
+                        }
+                    }
+                    entries
+                }
+                Err(e) => return Err(e),
+            };
+
+        for entry in collection_entries {
+            let col_name = entry.name.clone();
+            let col_prefix = self.blob_prefix.child(col_name.as_str());
+
+            // Skip if this collection already exists in memory.
+            if self.collections.read().await.contains_key(&col_name) {
+                continue;
+            }
+
+            // Config comes directly from the catalog entry — no per-collection blob read needed.
+            let bucket_duration = Duration::from_secs(entry.bucket_duration_secs);
+            let mut index = match TimeBucketIndex::new(
+                entry.dim,
+                entry.m,
+                entry.m_max0,
+                entry.ef_construction,
+                bucket_duration,
+                top_k_quickselect,
+                rand::rngs::StdRng::seed_from_u64(0),
+            ) {
+                Ok(idx) => idx,
+                Err(e) => {
+                    eprintln!("recovery: {col_name}: invalid config in collection.json: {e}");
+                    continue;
+                }
+            };
+
+            // List seq_*/ prefixes to find bucket snapshots.
+            let bucket_list = match store
+                .list_with_delimiter(Some(&col_prefix))
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("recovery: {col_name}: failed to list buckets: {e}");
+                    continue;
+                }
+            };
+
+            // Gather (created_at, seq, versioned_prefix) for all buckets, then sort oldest-first.
+            // bucket_meta.json lives at seq_<N>/ and points to the versioned snap_<T>/ subdir
+            // where the actual arena files reside.
+            let mut bucket_infos: Vec<(u64, u32, ObjectPath)> = Vec::new();
+            for bucket_prefix in bucket_list.common_prefixes {
+                let meta = match download_bucket_meta(store.as_ref(), &bucket_prefix).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!(
+                            "recovery: {col_name}/{}: bucket_meta.json missing: {e}",
+                            bucket_prefix
+                        );
+                        continue;
+                    }
+                };
+                // Resolve the versioned subdirectory where the arena files live.
+                let versioned_prefix = bucket_prefix.child(meta.snap_dir.as_str());
+                bucket_infos.push((meta.created_at_secs, meta.seq, versioned_prefix));
+            }
+            bucket_infos.sort_unstable_by_key(|&(created_at, seq, _)| (created_at, seq));
+
+            // Download and restore each bucket oldest-first.
+            for (created_at_secs, seq, versioned_prefix) in bucket_infos {
+                let local_dir = self.data_dir.join(&col_name).join(format!("recover_{seq}"));
+
+                if let Err(e) = std::fs::create_dir_all(&local_dir) {
+                    eprintln!("recovery: {col_name}/seq_{seq}: mkdir failed: {e}");
+                    continue;
+                }
+
+                let download = async {
+                    download_arena_dir(store.as_ref(), &versioned_prefix, &local_dir).await?;
+                    download_levels(
+                        store.as_ref(),
+                        &versioned_prefix,
+                        &local_dir.join("levels.bin"),
+                    )
+                    .await?;
+                    download_manifest(
+                        store.as_ref(),
+                        &versioned_prefix,
+                        &local_dir.join("manifest.json"),
+                    )
+                    .await
+                };
+                if let Err(e) = download.await {
+                    eprintln!("recovery: {col_name}/seq_{seq}: blob download failed: {e}");
+                    let _ = std::fs::remove_dir_all(&local_dir);
+                    continue;
+                }
+
+                match index.add_restored_bucket(
+                    BucketSeq(seq),
+                    Timestamp(created_at_secs),
+                    &local_dir,
+                ) {
+                    Ok(n) => eprintln!("recovery: {col_name}/seq_{seq}: restored {n} block(s)"),
+                    Err(e) => eprintln!("recovery: {col_name}/seq_{seq}: restore failed: {e}"),
+                }
+
+                let _ = std::fs::remove_dir_all(&local_dir);
+            }
+
+            eprintln!(
+                "recovery: {col_name}: {} bucket(s) restored",
+                index.bucket_count()
+            );
+            self.collections
+                .write()
+                .await
+                .insert(col_name, Arc::new(RwLock::new(index)));
+        }
+
+        Ok(())
     }
 }
 
@@ -135,14 +565,54 @@ impl MemWeaver for MemWeaverService {
         )
         .map_err(|e| invalid(format!("invalid index config: {e}")))?;
 
-        let mut cols = self.collections.write().await;
-        if cols.contains_key(&r.collection) {
-            return Err(Status::already_exists(format!(
-                "collection '{}' already exists",
-                r.collection
-            )));
+        // Insert under the write lock, then release it before any async S3 work.
+        {
+            let mut cols = self.collections.write().await;
+            if cols.contains_key(&r.collection) {
+                return Err(Status::already_exists(format!(
+                    "collection '{}' already exists",
+                    r.collection
+                )));
+            }
+            cols.insert(r.collection.clone(), Arc::new(RwLock::new(index)));
         }
-        cols.insert(r.collection, Arc::new(RwLock::new(index)));
+
+        // Best-effort: write the updated catalog to blob storage so recovery knows this
+        // collection exists (with its full config). Done after releasing the write
+        // lock to avoid holding it across async I/O. Failure is logged, not fatal.
+        if let Some(store) = &self.store {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            // Read configs from all collections under a shared read lock.
+            let mut entries: Vec<CatalogEntry> = {
+                let cols = self.collections.read().await;
+                let mut v = Vec::with_capacity(cols.len());
+                for (name, col) in cols.iter() {
+                    let (dim, m, m_max0, ef_construction, bd) = col.read().await.config();
+                    v.push(CatalogEntry {
+                        name: name.clone(),
+                        dim,
+                        m,
+                        m_max0,
+                        ef_construction,
+                        bucket_duration_secs: bd.as_secs(),
+                        snapshot_at_secs: now_secs,
+                    });
+                }
+                v
+            };
+            entries.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+            let catalog = Catalog {
+                version: 1,
+                collections: entries,
+            };
+            if let Err(e) = upload_catalog(store.as_ref(), &catalog, &self.blob_prefix).await {
+                eprintln!("create_collection: catalog upload failed: {e}");
+            }
+        }
+
         Ok(Response::new(CreateCollectionResponse {}))
     }
 
@@ -267,10 +737,10 @@ impl MemWeaver for MemWeaverService {
         let store = self
             .store
             .as_ref()
-            .ok_or_else(|| Status::failed_precondition("S3 not configured"))?;
+            .ok_or_else(|| Status::failed_precondition("blob storage not configured"))?;
         let col = get_collection(&self.collections, &r.collection).await?;
         let local_dir = self.bucket_local_dir(&r.collection, r.bucket_seq);
-        let prefix = self.bucket_s3_prefix(&r.collection, r.bucket_seq);
+        let prefix = self.bucket_blob_prefix(&r.collection, r.bucket_seq);
         std::fs::create_dir_all(&local_dir).map_err(internal)?;
         let seq = BucketSeq(r.bucket_seq);
 
@@ -281,7 +751,7 @@ impl MemWeaver for MemWeaverService {
             .swap_bucket_out(seq, &local_dir)
             .map_err(internal)?;
 
-        // Upload to S3 without any lock — files are stable on disk.
+        // Upload to blob storage without any lock — files are stable on disk.
         if found {
             upload_arena_dir(store.as_ref(), &local_dir, &prefix)
                 .await
@@ -305,10 +775,10 @@ impl MemWeaver for MemWeaverService {
         let store = self
             .store
             .as_ref()
-            .ok_or_else(|| Status::failed_precondition("S3 not configured"))?;
+            .ok_or_else(|| Status::failed_precondition("blob storage not configured"))?;
         let col = get_collection(&self.collections, &r.collection).await?;
         let local_dir = self.bucket_local_dir(&r.collection, r.bucket_seq);
-        let prefix = self.bucket_s3_prefix(&r.collection, r.bucket_seq);
+        let prefix = self.bucket_blob_prefix(&r.collection, r.bucket_seq);
         let seq = BucketSeq(r.bucket_seq);
 
         // Probe existence before downloading.
@@ -321,7 +791,7 @@ impl MemWeaver for MemWeaverService {
             }
         }
 
-        // Download from S3 without any lock.
+        // Download from blob storage without any lock.
         std::fs::create_dir_all(&local_dir).map_err(internal)?;
         download_arena_dir(store.as_ref(), &prefix, &local_dir)
             .await

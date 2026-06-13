@@ -328,18 +328,26 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
             .collect();
 
         let resp = client
-            .batch_insert(BatchInsertRequest { collection: COLLECTION.into(), items })
+            .batch_insert(BatchInsertRequest {
+                collection: COLLECTION.into(),
+                items,
+            })
             .await
             .expect("BatchInsert");
 
         for r in resp.into_inner().results {
-            bucket_map.entry(r.bucket_seq).or_default().push(r.vector_id as usize);
+            bucket_map
+                .entry(r.bucket_seq)
+                .or_default()
+                .push(r.vector_id as usize);
             in_memory += 1;
         }
 
         // Evict oldest buckets while over the memory limit.
         while in_memory > mem_limit {
-            let Some((&oldest_seq, _)) = bucket_map.first_key_value() else { break };
+            let Some((&oldest_seq, _)) = bucket_map.first_key_value() else {
+                break;
+            };
             let evict_resp = client
                 .evict_bucket(EvictBucketRequest {
                     collection: COLLECTION.into(),
@@ -372,7 +380,11 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
 
     // Eviction must have fired if n_base > mem_limit.
     if ctx.n_base > mem_limit {
-        assert!(total_evicted > 0, "expected evictions for n_base={} mem_limit={mem_limit}", ctx.n_base);
+        assert!(
+            total_evicted > 0,
+            "expected evictions for n_base={} mem_limit={mem_limit}",
+            ctx.n_base
+        );
     }
 
     // Build surviving corpus (only in-memory vectors, preserving original IDs).
@@ -394,7 +406,11 @@ async fn run_sift1m(client: &mut MemWeaverClient<Channel>) {
         let mut scored: Vec<(u64, f32)> = surviving
             .iter()
             .map(|(id, v)| {
-                let d: f32 = query.iter().zip(v.iter()).map(|(a, b)| (a - b) * (a - b)).sum();
+                let d: f32 = query
+                    .iter()
+                    .zip(v.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
                 (*id, d)
             })
             .collect();

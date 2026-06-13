@@ -17,6 +17,181 @@ use object_store::{path::Path as ObjectPath, ObjectStore, PutPayload};
 const ARENA_EXT: &str = "arena";
 const LEVELS_FILE: &str = "levels.bin";
 const MANIFEST_FILE: &str = "manifest.json";
+const COLLECTION_META_FILE: &str = "collection.json";
+const BUCKET_META_FILE: &str = "bucket_meta.json";
+const CATALOG_FILE: &str = "catalog.json";
+
+/// Configuration snapshot for a collection, stored at `<prefix>/collection.json`.
+/// Written once per snapshot cycle and read during crash recovery to recreate the
+/// [`crate::TimeBucketIndex`] with the correct parameters.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CollectionMeta {
+    pub version: u32,
+    pub dim: usize,
+    pub m: usize,
+    pub m_max0: usize,
+    pub ef_construction: usize,
+    pub bucket_duration_secs: u64,
+    /// Unix timestamp (seconds) when this snapshot was written.
+    pub snapshot_at_secs: u64,
+}
+
+/// Per-bucket metadata stored at `<prefix>/seq_<N>/bucket_meta.json`.
+///
+/// Acts as the atomic commit pointer for a bucket snapshot. The actual arena
+/// files live in `<prefix>/seq_<N>/<snap_dir>/` rather than directly in
+/// `seq_<N>/`, so that a new upload can be staged without overwriting the
+/// current complete snapshot. Only after all files are uploaded is
+/// `bucket_meta.json` updated to point to the new `snap_dir`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BucketMeta {
+    pub version: u32,
+    pub seq: u32,
+    pub created_at_secs: u64,
+    /// Subdirectory under `seq_<N>/` that holds this snapshot's arena files,
+    /// `levels.bin`, and `manifest.json`. Format: `"snap_<unix_secs>"`.
+    pub snap_dir: String,
+}
+
+/// One entry in the [`Catalog`], carrying both the collection name and the index
+/// configuration required to recreate a [`crate::TimeBucketIndex`] after a crash.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub dim: usize,
+    pub m: usize,
+    pub m_max0: usize,
+    pub ef_construction: usize,
+    pub bucket_duration_secs: u64,
+    /// Unix timestamp (seconds) when this catalog entry was last written.
+    pub snapshot_at_secs: u64,
+}
+
+/// Registry of live collections, stored at `<prefix>/catalog.json`.
+///
+/// Written atomically on every `CreateCollection` (and `DeleteCollection`) so that
+/// crash recovery can determine which collections were active at crash time without
+/// blindly re-importing every S3 prefix, and can recreate each index with the
+/// correct configuration without needing a prior snapshot to be present.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Catalog {
+    pub version: u32,
+    /// Sorted list of active collections with their index configurations.
+    pub collections: Vec<CatalogEntry>,
+}
+
+/// Upload a [`Catalog`] as JSON to `<prefix>/catalog.json` in `store`.
+/// Overwrites any existing catalog atomically (single PUT).
+pub async fn upload_catalog(
+    store: &dyn ObjectStore,
+    catalog: &Catalog,
+    prefix: &ObjectPath,
+) -> io::Result<()> {
+    let json =
+        serde_json::to_vec(catalog).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let remote = prefix.child(CATALOG_FILE);
+    store
+        .put(&remote, PutPayload::from(Bytes::from(json)))
+        .await
+        .map_err(to_io)
+        .map(|_| ())
+}
+
+/// Download `<prefix>/catalog.json` from `store` and deserialize it.
+/// Returns `Err` with `ErrorKind::NotFound` if the catalog does not exist yet,
+/// allowing callers to distinguish a missing catalog from other S3 errors.
+pub async fn download_catalog(store: &dyn ObjectStore, prefix: &ObjectPath) -> io::Result<Catalog> {
+    let remote = prefix.child(CATALOG_FILE);
+    let get = store.get(&remote).await.map_err(|e| match e {
+        object_store::Error::NotFound { .. } => io::Error::new(io::ErrorKind::NotFound, e),
+        other => to_io(other),
+    })?;
+    let bytes = get.bytes().await.map_err(to_io)?;
+    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Upload a [`CollectionMeta`] as JSON to `<prefix>/collection.json` in `store`.
+pub async fn upload_collection_meta(
+    store: &dyn ObjectStore,
+    meta: &CollectionMeta,
+    prefix: &ObjectPath,
+) -> io::Result<()> {
+    let json =
+        serde_json::to_vec(meta).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let remote = prefix.child(COLLECTION_META_FILE);
+    store
+        .put(&remote, PutPayload::from(Bytes::from(json)))
+        .await
+        .map_err(to_io)
+        .map(|_| ())
+}
+
+/// Download `<prefix>/collection.json` from `store` and deserialize it.
+pub async fn download_collection_meta(
+    store: &dyn ObjectStore,
+    prefix: &ObjectPath,
+) -> io::Result<CollectionMeta> {
+    let remote = prefix.child(COLLECTION_META_FILE);
+    let bytes = store
+        .get(&remote)
+        .await
+        .map_err(to_io)?
+        .bytes()
+        .await
+        .map_err(to_io)?;
+    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Upload a [`BucketMeta`] as JSON to `<prefix>/bucket_meta.json` in `store`.
+pub async fn upload_bucket_meta(
+    store: &dyn ObjectStore,
+    meta: &BucketMeta,
+    prefix: &ObjectPath,
+) -> io::Result<()> {
+    let json =
+        serde_json::to_vec(meta).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let remote = prefix.child(BUCKET_META_FILE);
+    store
+        .put(&remote, PutPayload::from(Bytes::from(json)))
+        .await
+        .map_err(to_io)
+        .map(|_| ())
+}
+
+/// Download `<prefix>/bucket_meta.json` from `store` and deserialize it.
+pub async fn download_bucket_meta(
+    store: &dyn ObjectStore,
+    prefix: &ObjectPath,
+) -> io::Result<BucketMeta> {
+    let remote = prefix.child(BUCKET_META_FILE);
+    let bytes = store
+        .get(&remote)
+        .await
+        .map_err(to_io)?
+        .bytes()
+        .await
+        .map_err(to_io)?;
+    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Delete every object whose key starts with `prefix` in `store`.
+///
+/// Used to remove stale bucket snapshots after they are superseded. Lists all
+/// objects under `prefix`, then issues individual deletes. Returns the number of
+/// objects deleted. Partial failures are returned as the first error; already
+/// deleted objects are not retried.
+pub async fn delete_prefix(store: &dyn ObjectStore, prefix: &ObjectPath) -> io::Result<usize> {
+    let mut list = store.list(Some(prefix));
+    let mut paths = Vec::new();
+    while let Some(meta) = list.next().await {
+        paths.push(meta.map_err(to_io)?.location);
+    }
+    let count = paths.len();
+    for path in paths {
+        store.delete(&path).await.map_err(to_io)?;
+    }
+    Ok(count)
+}
 
 /// Result of a single block upload: the source path and the destination object path.
 #[derive(Debug, Clone)]

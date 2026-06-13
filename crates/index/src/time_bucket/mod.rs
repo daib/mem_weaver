@@ -155,6 +155,28 @@ impl TimeBucketIndex {
         })
     }
 
+    /// Returns `(dim, m, m_max0, ef_construction, bucket_duration)` — the configuration
+    /// needed to recreate this index after a crash.
+    pub fn config(&self) -> (usize, usize, usize, usize, Duration) {
+        (
+            self.dim,
+            self.m,
+            self.m_max0,
+            self.ef_construction,
+            self.bucket_duration,
+        )
+    }
+
+    /// Returns the sequence numbers of all active buckets, newest first.
+    pub fn bucket_seqs(&self) -> Vec<BucketSeq> {
+        self.buckets.iter().map(|b| b.seq).collect()
+    }
+
+    /// Returns `(seq, created_at)` for every active bucket, newest first.
+    pub fn bucket_metas(&self) -> Vec<(BucketSeq, Timestamp)> {
+        self.buckets.iter().map(|b| (b.seq, b.created_at)).collect()
+    }
+
     /// Returns `true` if a bucket with `seq` is tracked by this index.
     pub fn has_bucket(&self, seq: BucketSeq) -> bool {
         self.buckets.iter().any(|b| b.seq == seq)
@@ -344,6 +366,107 @@ impl TimeBucketIndex {
     /// Returns `None` if the index is empty.
     pub fn evict_oldest(&mut self) -> Option<BucketSeq> {
         self.buckets.pop_back().map(|b| b.seq)
+    }
+
+    /// Write a point-in-time snapshot of the bucket identified by `seq` to `dir` without
+    /// changing any storage state. The output is identical in format to what
+    /// [`swap_bucket_out`](TimeBucketIndex::swap_bucket_out) produces, so the directory
+    /// can be uploaded to S3 and later restored.
+    ///
+    /// Two cases are handled:
+    /// - **In-memory bucket** (never swapped): arena blocks are copied via
+    ///   [`HnswIndex::snapshot_to_dir`], then `levels.bin` and `manifest.json` are written
+    ///   from the live in-memory index state.
+    /// - **On-disk bucket** (previously swapped via [`swap_bucket_out`]): all files are
+    ///   copied directly from the existing swap directory. This is necessary because
+    ///   `levels.bin`/`manifest.json` are already on disk from the swap, and
+    ///   `clear_level_data` will have cleared the in-memory graph metadata.
+    ///
+    /// Evicted buckets (no local copy at all) are treated as on-disk if a swap directory
+    /// is recorded; otherwise only metadata is written (arena files will be absent).
+    ///
+    /// Returns `Ok(true)` if the bucket was found, `Ok(false)` if no such bucket exists.
+    pub fn snapshot_bucket(&self, seq: BucketSeq, dir: &std::path::Path) -> std::io::Result<bool> {
+        let Some(bucket) = self.buckets.iter().find(|b| b.seq == seq) else {
+            return Ok(false);
+        };
+        std::fs::create_dir_all(dir)?;
+
+        if let Some(swap_dir) = &bucket.swap_dir {
+            // Bucket was (at least partially) swapped to disk. The authoritative files —
+            // block_*.arena, levels.bin, manifest.json — are already there. Copy them
+            // all so the snapshot dir is a complete, self-contained copy.
+            //
+            // If the swap_dir no longer exists the local files were deleted after a
+            // successful S3 upload (`SwapBucketOutToBlob` + manual remove_dir_all).
+            // The bucket already lives in S3 — return `Ok(false)` to tell the caller
+            // there is nothing left to snapshot locally.
+            match std::fs::read_dir(swap_dir) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+                Ok(entries) => {
+                    for entry in entries {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_file() {
+                            let filename = path.file_name().expect("file in swap dir has a name");
+                            std::fs::copy(&path, dir.join(filename))?;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Bucket is fully in memory. Snapshot arena bytes and write metadata now.
+            bucket.index.snapshot_to_dir(dir)?;
+            bucket.index.save_levels(&dir.join("levels.bin"))?;
+            bucket.index.save_manifest(&dir.join("manifest.json"))?;
+        }
+
+        Ok(true)
+    }
+
+    /// Restore a bucket from files previously written by
+    /// [`snapshot_bucket`](TimeBucketIndex::snapshot_bucket) (or
+    /// [`swap_bucket_out`](TimeBucketIndex::swap_bucket_out)) and add it to this index.
+    ///
+    /// `local_dir` must contain `block_*.arena`, `levels.bin`, and `manifest.json`.
+    /// The bucket is inserted in deque order: call this method with buckets sorted
+    /// oldest-first (ascending `created_at`) to maintain the front=newest invariant.
+    ///
+    /// `next_seq` is advanced past `seq` so future allocations never reuse the same id.
+    ///
+    /// Returns the number of arena blocks restored.
+    pub fn add_restored_bucket(
+        &mut self,
+        seq: BucketSeq,
+        created_at: Timestamp,
+        local_dir: &std::path::Path,
+    ) -> std::io::Result<usize> {
+        let bucket_rng = StdRng::seed_from_u64(seq.0 as u64);
+        let mut index: Box<dyn HnswIndex + Send + Sync> = Box::new(HnswArena::new(
+            self.dim,
+            self.m,
+            self.m_max0,
+            self.ef_construction,
+            NODE_BLOCK_CAPACITY,
+            self.closest_m_candidates,
+            bucket_rng,
+        ));
+        let restored = index.load_blocks_from_dir(local_dir)?;
+        index.load_levels(&local_dir.join("levels.bin"))?;
+        index.rebuild_lens(); // fix block.len so len()/is_empty() are correct
+        index.load_manifest(&local_dir.join("manifest.json"))?;
+        // push_front so that the last call (newest bucket) ends up at the front.
+        self.buckets.push_front(Bucket {
+            seq,
+            created_at,
+            index,
+            swap_dir: None,
+        });
+        if seq.0 >= self.next_seq.0 {
+            self.next_seq = BucketSeq(seq.0 + 1);
+        }
+        Ok(restored)
     }
 
     /// Move the bucket identified by `seq` from RAM to disk under `dir`. The bucket
@@ -1043,5 +1166,425 @@ mod tests {
         let mut list = store.list(Some(&prefix));
         use futures::StreamExt;
         assert!(list.next().await.is_none(), "no objects uploaded");
+    }
+
+    // ── snapshot_bucket ───────────────────────────────────────────────────────
+
+    #[test]
+    fn snapshot_bucket_unknown_seq_returns_false() {
+        let root = unique_swap_dir("snap_unknown");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0), 0u64);
+
+        let snap_dir = root.join("snap_999");
+        let found = idx
+            .snapshot_bucket(BucketSeq(999), &snap_dir)
+            .expect("no IO for missing seq");
+        assert!(!found);
+        assert!(!snap_dir.exists(), "no directory created for unknown seq");
+    }
+
+    #[test]
+    fn snapshot_bucket_writes_arena_levels_and_manifest() {
+        let root = unique_swap_dir("snap_files");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0), 0u64);
+        idx.insert(&[2.0; 4], ts(0), 1u64);
+        let seq = BucketSeq(0);
+
+        let snap_dir = root.join("snap_0");
+        let found = idx.snapshot_bucket(seq, &snap_dir).expect("snapshot");
+        assert!(found, "bucket must be found");
+
+        // At least one arena file, plus levels.bin and manifest.json.
+        let arena_files: Vec<_> = std::fs::read_dir(&snap_dir)
+            .expect("read snap_dir")
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                let is_arena = p.extension().and_then(|s| s.to_str()) == Some("arena");
+                is_arena.then_some(p)
+            })
+            .collect();
+        assert!(
+            !arena_files.is_empty(),
+            "snapshot must produce at least one .arena file"
+        );
+        assert!(snap_dir.join("levels.bin").exists(), "levels.bin missing");
+        assert!(
+            snap_dir.join("manifest.json").exists(),
+            "manifest.json missing"
+        );
+    }
+
+    #[test]
+    fn snapshot_bucket_does_not_change_storage_state() {
+        // After snapshot_bucket the index must still be fully searchable (no swap happened).
+        let root = unique_swap_dir("snap_state");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64);
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 1u64);
+        let seq = BucketSeq(0);
+
+        let before = idx.search(&[0.0; 4], 2, 16, |_, d| d, None, top_k_quickselect);
+
+        idx.snapshot_bucket(seq, &root.join("snap_0"))
+            .expect("snapshot");
+
+        // Search results must be identical — no storage state was changed.
+        let after = idx.search(&[0.0; 4], 2, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(
+            after, before,
+            "search results must not change after snapshot"
+        );
+        assert_eq!(idx.bucket_count(), 1, "bucket count must not change");
+        assert_eq!(idx.len(), 2, "vector count must not change");
+        let _ = (bid0, bid1);
+    }
+
+    #[test]
+    fn snapshot_bucket_in_memory_files_survive_crc32_and_restore_search() {
+        // Snapshot an in-memory bucket, then evict and restore from the snapshot.
+        let root = unique_swap_dir("snap_restore_mem");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64);
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 1u64);
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 2u64);
+        let seq = BucketSeq(0);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(before.len(), 3);
+
+        // Snapshot while bucket is in memory.
+        let snap_dir = root.join("snap_0");
+        assert!(idx.snapshot_bucket(seq, &snap_dir).expect("snapshot"));
+
+        // Evict via an intermediate swap so we can restore from the snapshot only.
+        let swap_dir = root.join("swap_0");
+        assert!(idx.swap_bucket_out(seq, &swap_dir).expect("swap_out"));
+        idx.evict_bucket(seq).expect("evict");
+
+        // Restore from snapshot — CRC32 must pass.
+        let restored = idx
+            .restore_bucket_from_local(seq, &snap_dir)
+            .expect("restore_bucket_from_local from snapshot")
+            .expect("bucket must be present");
+        assert!(restored >= 1, "at least one block restored");
+
+        let after = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(
+            after, before,
+            "search results must match baseline after restore from snapshot"
+        );
+    }
+
+    #[test]
+    fn snapshot_bucket_on_disk_copies_swap_dir_files() {
+        // After swap_bucket_out, snapshot_bucket must copy the on-disk arena files
+        // (not try to re-snapshot in-memory blocks, which no longer exist).
+        let root = unique_swap_dir("snap_ondisk");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64);
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 1u64);
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 2u64);
+        let seq = BucketSeq(0);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+
+        // Swap the bucket out to disk.
+        let swap_dir = root.join("swap_0");
+        assert!(idx.swap_bucket_out(seq, &swap_dir).expect("swap_out"));
+
+        // Now snapshot the already-on-disk bucket.
+        let snap_dir = root.join("snap_0");
+        assert!(idx
+            .snapshot_bucket(seq, &snap_dir)
+            .expect("snapshot on-disk bucket"));
+
+        // The snapshot dir must contain at least one .arena file and both metadata files.
+        let arena_count = std::fs::read_dir(&snap_dir)
+            .expect("read snap_dir")
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .and_then(|e| {
+                        e.path()
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|ext| ext == "arena")
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert!(
+            arena_count >= 1,
+            "snapshot of on-disk bucket must include arena files"
+        );
+        assert!(
+            snap_dir.join("levels.bin").exists(),
+            "levels.bin must be present in snapshot"
+        );
+        assert!(
+            snap_dir.join("manifest.json").exists(),
+            "manifest.json must be present in snapshot"
+        );
+
+        // The snapshot files must be byte-identical to the swap_dir files.
+        for filename in &["levels.bin", "manifest.json"] {
+            assert_eq!(
+                std::fs::read(snap_dir.join(filename)).unwrap(),
+                std::fs::read(swap_dir.join(filename)).unwrap(),
+                "{filename}: snapshot and swap_dir bytes must match"
+            );
+        }
+
+        // Evict and restore from the snapshot to prove it is self-contained.
+        idx.evict_bucket(seq).expect("evict");
+        let restored = idx
+            .restore_bucket_from_local(seq, &snap_dir)
+            .expect("restore from snapshot")
+            .expect("bucket present");
+        assert!(restored >= 1);
+
+        let after = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(
+            after, before,
+            "search must match baseline after on-disk snapshot round-trip"
+        );
+    }
+
+    #[test]
+    fn snapshot_bucket_multiple_buckets_each_snapshotted_independently() {
+        // Three buckets; snapshot only the middle one. The other two must be untouched.
+        let root = unique_swap_dir("snap_multi");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(1);
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64); // seq=0
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(1), 1u64); // seq=1
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(2), 2u64); // seq=2
+        assert_eq!(idx.bucket_count(), 3);
+
+        let seqs: Vec<BucketSeq> = idx.bucket_seqs();
+        assert_eq!(seqs.len(), 3);
+
+        // Snapshot only the middle bucket (seq=1).
+        let snap_dir = root.join("snap_seq1");
+        assert!(idx
+            .snapshot_bucket(BucketSeq(1), &snap_dir)
+            .expect("snapshot seq=1"));
+        assert!(!root.join("snap_seq0").exists(), "seq=0 not snapshotted");
+        assert!(!root.join("snap_seq2").exists(), "seq=2 not snapshotted");
+
+        // All three buckets remain searchable.
+        let results = idx.search(&[0.0; 4], 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(results.len(), 3, "all three vectors still retrievable");
+    }
+
+    // ── add_restored_bucket ───────────────────────────────────────────────────
+
+    #[test]
+    fn add_restored_bucket_recreates_searchable_index() {
+        let root = unique_swap_dir("restore_bucket");
+        let _guard = DirGuard(root.clone());
+
+        // Build an original index with two buckets.
+        let mut src = make_index(10);
+        let bid0 = src.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 10u64);
+        let bid1 = src.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 11u64);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = src.search(&query, 2, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(before.len(), 2);
+
+        // Snapshot bucket seq=0.
+        let snap = root.join("snap_0");
+        let (seq, created_at) = src.bucket_metas()[0];
+        assert!(src.snapshot_bucket(seq, &snap).expect("snapshot"));
+
+        // Restore into a fresh index.
+        let mut dst = make_index(10);
+        let n = dst
+            .add_restored_bucket(seq, created_at, &snap)
+            .expect("add_restored_bucket");
+        assert!(n >= 1, "at least one block restored");
+        assert_eq!(dst.bucket_count(), 1);
+
+        // Search results must match.
+        let after = dst.search(&query, 2, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(
+            after, before,
+            "restored index must return identical results"
+        );
+        let _ = (bid0, bid1);
+    }
+
+    #[test]
+    fn add_restored_bucket_multiple_buckets_sorted_oldest_first() {
+        let root = unique_swap_dir("restore_multi");
+        let _guard = DirGuard(root.clone());
+
+        let mut src = TimeBucketIndex::new(
+            4,
+            4,
+            8,
+            32,
+            std::time::Duration::from_secs(1),
+            top_k_quickselect,
+            rand::rngs::StdRng::seed_from_u64(1),
+        )
+        .unwrap();
+        src.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64); // seq=0 oldest
+        src.insert(&[1.0, 0.0, 0.0, 0.0], ts(1), 1u64); // seq=1
+        src.insert(&[2.0, 0.0, 0.0, 0.0], ts(2), 2u64); // seq=2 newest
+        assert_eq!(src.bucket_count(), 3);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = src.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+
+        // Snapshot all buckets.
+        let metas = src.bucket_metas();
+        for &(seq, _) in &metas {
+            let snap = root.join(format!("snap_{}", seq.0));
+            assert!(src.snapshot_bucket(seq, &snap).expect("snapshot"));
+        }
+
+        // Restore oldest-first into a fresh index.
+        let mut dst = TimeBucketIndex::new(
+            4,
+            4,
+            8,
+            32,
+            std::time::Duration::from_secs(1),
+            top_k_quickselect,
+            rand::rngs::StdRng::seed_from_u64(0),
+        )
+        .unwrap();
+        // metas is newest-first; reverse to restore oldest-first.
+        let mut sorted = metas.clone();
+        sorted.sort_by_key(|&(seq, _)| seq);
+        for (seq, created_at) in sorted {
+            let snap = root.join(format!("snap_{}", seq.0));
+            dst.add_restored_bucket(seq, created_at, &snap)
+                .expect("add_restored_bucket");
+        }
+
+        assert_eq!(dst.bucket_count(), 3);
+        // next_seq must be past the highest restored seq.
+        dst.insert(&[3.0, 0.0, 0.0, 0.0], ts(3), 99u64);
+        assert_eq!(
+            dst.bucket_count(),
+            4,
+            "new insert must open a new bucket, not reuse seq=2"
+        );
+
+        let mut after = dst.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        let mut before_sorted = before.clone();
+        // quickselect does not guarantee order; sort by vector_id for a stable comparison.
+        after.sort_by_key(|&(vid, _)| vid);
+        before_sorted.sort_by_key(|&(vid, _)| vid);
+        assert_eq!(
+            after, before_sorted,
+            "restored multi-bucket index must match original search"
+        );
+    }
+
+    #[test]
+    fn snapshot_bucket_evicted_with_deleted_local_files_returns_false() {
+        // After swap_out + upload to S3 + remove_dir_all, the swap_dir no longer exists
+        // locally. snapshot_bucket must return Ok(false) — the bucket is already in S3
+        // and there is nothing to snapshot locally.
+        let root = unique_swap_dir("snap_evicted_nogap");
+        let _guard = DirGuard(root.clone());
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0), 0u64);
+        let seq = BucketSeq(0);
+
+        // Simulate the swap-out → upload → remove_dir_all lifecycle.
+        let swap_dir = root.join("swap_0");
+        assert!(idx.swap_bucket_out(seq, &swap_dir).expect("swap_out"));
+        idx.evict_bucket(seq).expect("evict");
+        std::fs::remove_dir_all(&swap_dir).expect("remove swap_dir");
+        assert!(!swap_dir.exists(), "local files gone");
+
+        let snap_dir = root.join("snap_0");
+        let found = idx
+            .snapshot_bucket(seq, &snap_dir)
+            .expect("no error for evicted bucket with deleted local files");
+        assert!(
+            !found,
+            "Ok(false) signals bucket already in S3 — nothing to snapshot locally"
+        );
+        // No files written to the snap_dir.
+        assert!(
+            !snap_dir.exists()
+                || std::fs::read_dir(&snap_dir)
+                    .map(|mut d| d.next().is_none())
+                    .unwrap_or(true),
+            "snap_dir must be empty or absent when bucket is already in S3"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_bucket_files_uploadable_and_restorable_via_blob() {
+        // Full round-trip: snapshot → upload to InMemory store → evict → download → restore.
+        use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore};
+        use std::sync::Arc;
+
+        let root = unique_swap_dir("snap_blob_rt");
+        let _guard = DirGuard(root.clone());
+
+        let mut idx = make_index(10);
+        idx.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 0u64);
+        idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 1u64);
+        idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 2u64);
+        let seq = BucketSeq(0);
+
+        let query = [0.5, 0.0, 0.0, 0.0];
+        let before = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(before.len(), 3);
+
+        // 1. Snapshot to local dir (read-only, in-memory copy preserved).
+        let snap_dir = root.join("snap_0");
+        assert!(idx.snapshot_bucket(seq, &snap_dir).expect("snapshot"));
+
+        // 2. Upload snapshot to blob store.
+        let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let prefix = ObjectPath::from("collections/test/seq_0");
+        crate::blob::upload_arena_dir(store.as_ref(), &snap_dir, &prefix)
+            .await
+            .expect("upload arenas");
+        crate::blob::upload_levels(store.as_ref(), &snap_dir.join("levels.bin"), &prefix)
+            .await
+            .expect("upload levels");
+        crate::blob::upload_manifest(store.as_ref(), &snap_dir.join("manifest.json"), &prefix)
+            .await
+            .expect("upload manifest");
+
+        // 3. Evict the in-memory bucket entirely (also wipe local snap dir).
+        let evicted = idx.evict_bucket(seq).expect("evict");
+        assert!(evicted >= 1);
+        std::fs::remove_dir_all(&snap_dir).expect("remove snap_dir");
+
+        // 4. Restore from blob.
+        let restore_dir = root.join("restored_0");
+        let restored = idx
+            .swap_bucket_in_from_blob(seq, store.as_ref(), &prefix, &restore_dir)
+            .await
+            .expect("swap_bucket_in_from_blob")
+            .expect("bucket present");
+        assert_eq!(restored, evicted);
+
+        // 5. Search must match baseline.
+        let after = idx.search(&query, 3, 16, |_, d| d, None, top_k_quickselect);
+        assert_eq!(
+            after, before,
+            "search must match baseline after snapshot → S3 → restore round-trip"
+        );
     }
 }

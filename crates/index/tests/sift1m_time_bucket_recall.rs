@@ -167,7 +167,9 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         let mut seen_seqs = std::collections::HashSet::new();
         for (i, v) in corpus.iter().enumerate() {
             let bid = index.insert(v.as_slice(), Timestamp(i as u64), i as u64);
-            seen_seqs.insert(bid.bucket_seq);
+            if let Some(bid) = bid {
+                seen_seqs.insert(bid.bucket_seq);
+            }
             if (i + 1) % 10_000 == 0 {
                 eprintln!(
                     "{label}: inserted [{}, {}) 10_000 vectors in {:.3} ms (cumulative build {:.3} ms)",

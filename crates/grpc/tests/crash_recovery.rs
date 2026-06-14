@@ -219,6 +219,7 @@ async fn recover_from_snapshots_restores_collections_and_search() {
         // Snapshot everything to S3 then "crash" by dropping the service.
         let _handle = svc.spawn_snapshot_task(SnapshotConfig {
             interval: Duration::from_millis(1),
+            min_dirty_vectors: 0,
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
         // svc dropped here — all in-memory state is gone.
@@ -544,6 +545,7 @@ async fn stale_bucket_prefixes_are_deleted_after_eviction() {
     // First snapshot: both seq_0 and seq_1 are uploaded.
     let _handle = svc.spawn_snapshot_task(SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -661,6 +663,7 @@ async fn eviction_during_snapshot_cycle_does_not_delete_snapshot_until_next_cycl
     // Run one full snapshot cycle to establish both prefixes in blob storage.
     let _handle = svc.spawn_snapshot_task(SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -786,6 +789,7 @@ async fn mid_upload_crash_leaves_previous_snapshot_intact() {
     // Take a complete snapshot (snap_<T1>/ committed, bucket_meta.json points to it).
     let _h = svc.spawn_snapshot_task(SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -876,6 +880,7 @@ async fn mid_upload_crash_leaves_previous_snapshot_intact() {
     svc3.recover_from_snapshots().await.expect("recover svc3");
     let _h3 = svc3.spawn_snapshot_task(SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -955,6 +960,7 @@ async fn wal_entries_pruned_after_successful_snapshot_cycle() {
     // and WAL entries up to that seq are pruned.
     let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1038,6 +1044,7 @@ async fn wal_replay_restores_vectors_to_all_buckets_after_partial_snapshot_crash
     // Snapshot seq_0, prune its WAL entry.
     let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
     if let Some(h) = _snap_h {
@@ -1519,6 +1526,7 @@ async fn dirty_bucket_uploaded_clean_bucket_skipped() {
     // Run snapshot cycles until the bucket is uploaded and marked clean.
     let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1670,6 +1678,7 @@ async fn dirty_flag_race_condition_stale_version_leaves_bucket_dirty_for_reuploa
     // ── Snapshot cycle runs, sees dirty bucket, re-uploads with both vectors ──
     let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
         interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -1713,5 +1722,279 @@ async fn dirty_flag_race_condition_stale_version_leaves_bucket_dirty_for_reuploa
         ids,
         vec![1, 2],
         "both vectors must survive crash — vid=2 was re-uploaded because dirty flag was preserved"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_skipped_when_dirty_vectors_below_threshold() {
+    // When total dirty vectors < min_dirty_vectors, the snapshot cycle must be skipped:
+    // no upload, no wal_high_seq advancement, no WAL pruning.
+
+    let store = shared_store();
+    let data_dir = temp_dir("threshold_skip");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 0,
+    }))
+    .await
+    .expect("create");
+
+    // Insert 2 vectors — well below the threshold of 100.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 1,
+            },
+            InsertItem {
+                vector: vec![0.0, 1.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 2,
+            },
+        ],
+    }))
+    .await
+    .expect("insert");
+
+    // WAL entry uploaded.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Snapshot task with threshold=100 — 2 dirty vectors < 100, so no snapshot fires.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+        min_dirty_vectors: 100,
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // No bucket_meta.json should exist — snapshot was suppressed by threshold.
+    let seq0_prefix = ObjectPath::from("pfx/col/seq_0");
+    let meta_result = index::download_bucket_meta(store.as_ref(), &seq0_prefix).await;
+    assert!(
+        meta_result.is_err(),
+        "bucket_meta.json must not be written when dirty vectors < threshold"
+    );
+
+    // WAL entries must still be present — wal_high_seq was not advanced.
+    let wal_seqs = index::list_wal_seqs(store.as_ref(), &ObjectPath::from("pfx/col"))
+        .await
+        .expect("list_wal_seqs");
+    assert!(
+        !wal_seqs.is_empty(),
+        "WAL entries must be preserved when snapshot cycle is suppressed by threshold"
+    );
+
+    // Bucket must still be dirty.
+    assert!(
+        svc.is_bucket_dirty_test("col", 0).await,
+        "bucket must remain dirty when snapshot was suppressed"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_fires_when_dirty_vectors_reach_threshold() {
+    // When total dirty vectors >= min_dirty_vectors, the snapshot must proceed normally:
+    // upload fires, bucket marked clean, WAL entries pruned.
+
+    let store = shared_store();
+    let data_dir = temp_dir("threshold_fire");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 0,
+    }))
+    .await
+    .expect("create");
+
+    // Insert exactly at the threshold.
+    let items: Vec<_> = (1u64..=3)
+        .map(|id| InsertItem {
+            vector: vec![id as f32, 0.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: id,
+        })
+        .collect();
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items,
+    }))
+    .await
+    .expect("insert");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Threshold=3: exactly 3 dirty vectors, snapshot must fire.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+        min_dirty_vectors: 3,
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Snapshot must have fired — bucket_meta.json present.
+    let meta = index::download_bucket_meta(store.as_ref(), &ObjectPath::from("pfx/col/seq_0"))
+        .await
+        .expect("bucket_meta.json must exist when dirty vectors >= threshold");
+    assert!(
+        meta.snap_dir.starts_with("snap_"),
+        "snap_dir must be versioned"
+    );
+
+    // WAL must be pruned after the successful snapshot.
+    let wal_seqs = index::list_wal_seqs(store.as_ref(), &ObjectPath::from("pfx/col"))
+        .await
+        .expect("list_wal_seqs");
+    assert!(
+        wal_seqs.is_empty(),
+        "WAL must be pruned after snapshot triggered by threshold"
+    );
+
+    // Bucket must be clean now.
+    assert!(
+        !svc.is_bucket_dirty_test("col", 0).await,
+        "bucket must be clean after snapshot fired at threshold"
+    );
+}
+
+#[tokio::test]
+async fn threshold_suppresses_snapshot_until_enough_vectors_accumulate() {
+    // Verifies the accumulation behavior: inserts below threshold are held in WAL,
+    // snapshot fires only once the total reaches the threshold, and crash recovery
+    // using the WAL works correctly before a snapshot is taken.
+
+    let store = shared_store();
+    let data_dir = temp_dir("threshold_accumulate");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 0,
+    }))
+    .await
+    .expect("create");
+
+    // Start snapshot task with threshold=5.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+        min_dirty_vectors: 5,
+    });
+
+    // Insert 2 vectors (below threshold). Cycles run but no snapshot fires.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 1,
+            },
+            InsertItem {
+                vector: vec![0.0, 1.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 2,
+            },
+        ],
+    }))
+    .await
+    .expect("first insert");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let no_meta =
+        index::download_bucket_meta(store.as_ref(), &ObjectPath::from("pfx/col/seq_0")).await;
+    assert!(
+        no_meta.is_err(),
+        "no snapshot after 2 vectors (below threshold=5)"
+    );
+
+    // Insert 3 more vectors — total reaches 5, snapshot must now fire.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![0.0, 0.0, 1.0, 0.0],
+                timestamp: 0,
+                vector_id: 3,
+            },
+            InsertItem {
+                vector: vec![0.0, 0.0, 0.0, 1.0],
+                timestamp: 0,
+                vector_id: 4,
+            },
+            InsertItem {
+                vector: vec![0.5, 0.5, 0.5, 0.5],
+                timestamp: 0,
+                vector_id: 5,
+            },
+        ],
+    }))
+    .await
+    .expect("second insert");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta = index::download_bucket_meta(store.as_ref(), &ObjectPath::from("pfx/col/seq_0"))
+        .await
+        .expect("snapshot must fire once threshold is reached");
+    assert!(
+        meta.snap_dir.starts_with("snap_"),
+        "snap_dir must be versioned"
+    );
+
+    // "Crash" and recover — all 5 vectors must be present.
+    drop(_snap_h);
+    drop(_wal_h);
+    drop(svc);
+
+    let svc2 = MemWeaverService::with_storage(data_dir, Some(Arc::clone(&store)), "pfx");
+    svc2.recover_from_snapshots().await.expect("recover");
+
+    let mut ids: Vec<u64> = search_sorted(&svc2, "col", vec![0.5, 0.5, 0.5, 0.5], 5, None)
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 5],
+        "all 5 vectors must be present after recovery"
     );
 }

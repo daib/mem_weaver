@@ -163,6 +163,34 @@ Without the fix (`mark_all_clean` instead of version-aware), step 4 would clear 
 
 ---
 
+## Snapshot threshold (`min_dirty_vectors`)
+
+### `snapshot_skipped_when_dirty_vectors_below_threshold`
+
+2 vectors inserted, `min_dirty_vectors=100`. The snapshot task runs many cycles but the total dirty vector count (2) is below the threshold, so:
+
+- No `bucket_meta.json` is written to blob storage.
+- WAL entries are preserved (wal_high_seq not advanced).
+- The bucket remains dirty.
+
+### `snapshot_fires_when_dirty_vectors_reach_threshold`
+
+3 vectors inserted, `min_dirty_vectors=3`. Total dirty vectors equals the threshold exactly, so the snapshot fires:
+
+- `bucket_meta.json` is written and points to a versioned `snap_T/`.
+- WAL entries are pruned.
+- Bucket is marked clean.
+
+### `threshold_suppresses_snapshot_until_enough_vectors_accumulate`
+
+Inserts arrive in two batches with `min_dirty_vectors=5`:
+
+- After batch 1 (2 vectors): threshold not reached → no snapshot, WAL preserved.
+- After batch 2 (+3 vectors, total=5): threshold reached → snapshot fires.
+- Crash + recovery: all 5 vectors found, whether they came from the snapshot or from WAL replay.
+
+---
+
 ## Key invariants tested
 
 | Property | Test(s) |
@@ -178,3 +206,6 @@ Without the fix (`mark_all_clean` instead of version-aware), step 4 would clear 
 | WAL spanning two buckets replays each to correct bucket | `wal_spanning_both_buckets_after_partial_snapshot` |
 | Dirty bucket uploaded, clean bucket skipped | `dirty_bucket_uploaded_clean_bucket_skipped` |
 | Stale write-count prevents premature mark-clean | `dirty_flag_race_condition_stale_version_leaves_bucket_dirty_for_reupload` |
+| Threshold suppresses snapshot below min vectors | `snapshot_skipped_when_dirty_vectors_below_threshold` |
+| Threshold fires snapshot at min vectors | `snapshot_fires_when_dirty_vectors_reach_threshold` |
+| Snapshot accumulates vectors until threshold met | `threshold_suppresses_snapshot_until_enough_vectors_accumulate` |

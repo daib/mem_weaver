@@ -1998,3 +1998,118 @@ async fn threshold_suppresses_snapshot_until_enough_vectors_accumulate() {
         "all 5 vectors must be present after recovery"
     );
 }
+
+#[tokio::test]
+async fn recovered_bucket_is_clean_without_wal_replay_dirty_with_wal_replay() {
+    // After recovery, a bucket restored from snapshot with no subsequent WAL replay
+    // must be clean (no unnecessary re-upload). A bucket that had WAL entries replayed
+    // into it must be dirty (new vectors not yet in the S3 snapshot).
+    //
+    // Two collections:
+    //   "stable" — snapshot taken, no new inserts before crash → clean after recovery
+    //   "active" — snapshot taken, then new insert before crash → dirty after recovery
+
+    let store = shared_store();
+    let data_dir = temp_dir("recovery_dirty_state");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    for col in ["stable", "active"] {
+        svc.create_collection(Request::new(CreateCollectionRequest {
+            collection: col.into(),
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 32,
+            bucket_duration_secs: 0,
+        }))
+        .await
+        .expect("create");
+    }
+
+    // Insert a baseline vector into both collections.
+    for (col, vid) in [("stable", 1u64), ("active", 2u64)] {
+        svc.batch_insert(Request::new(BatchInsertRequest {
+            collection: col.into(),
+            items: vec![InsertItem {
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: vid,
+            }],
+        }))
+        .await
+        .expect("baseline insert");
+    }
+
+    // Full snapshot: both collections snapshotted, WAL pruned, buckets marked clean.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+        min_dirty_vectors: 0,
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if let Some(h) = _snap_h {
+        h.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        !svc.is_bucket_dirty_test("stable", 0).await,
+        "stable must be clean after snapshot"
+    );
+    assert!(
+        !svc.is_bucket_dirty_test("active", 0).await,
+        "active must be clean after snapshot"
+    );
+
+    // Insert a new vector into "active" only — this goes to the WAL but no new snapshot.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "active".into(),
+        items: vec![InsertItem {
+            vector: vec![0.0, 1.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: 99,
+        }],
+    }))
+    .await
+    .expect("post-snapshot insert");
+
+    // Crash.
+    drop(_wal_h);
+    drop(svc);
+
+    // Recovery.
+    let svc2 = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    svc2.recover_from_snapshots().await.expect("recover");
+
+    // "stable": snapshot was current, no WAL replay → bucket must be clean after recovery.
+    assert!(
+        !svc2.is_bucket_dirty_test("stable", 0).await,
+        "stable bucket must be clean after recovery — snapshot was up to date, no WAL replay"
+    );
+
+    // "active": WAL replay inserted vid=99 → bucket must be dirty after recovery.
+    assert!(
+        svc2.is_bucket_dirty_test("active", 0).await,
+        "active bucket must be dirty after recovery — WAL replay added new vectors not yet in snapshot"
+    );
+
+    // Sanity: both collections have correct vectors.
+    let stable_hits = search_sorted(&svc2, "stable", vec![1.0, 0.0, 0.0, 0.0], 1, None).await;
+    assert_eq!(stable_hits.len(), 1);
+    assert_eq!(stable_hits[0].0, 1);
+
+    let active_hits = search_sorted(&svc2, "active", vec![0.0, 0.5, 0.0, 0.0], 2, None).await;
+    let mut ids: Vec<u64> = active_hits.iter().map(|&(v, _)| v).collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![2, 99],
+        "active must have both baseline and WAL-replayed vectors"
+    );
+}

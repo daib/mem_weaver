@@ -191,6 +191,26 @@ Inserts arrive in two batches with `min_dirty_vectors=5`:
 
 ---
 
+## Dirty state after recovery
+
+### `recovered_bucket_is_clean_without_wal_replay_dirty_with_wal_replay`
+
+Directly tests the `mark_clean_after_snapshot()` call in `add_restored_bucket`.
+
+Two collections — `stable` (snapshot current, no new inserts before crash) and `active` (snapshot taken, then one more insert before crash):
+
+1. Both collections snapshotted → WAL pruned → both buckets clean.
+2. New vector inserted into `active` only → WAL entry uploaded, `active` dirty.
+3. Crash.
+4. Recovery replays the WAL entry into `active` but has nothing to replay for `stable`.
+5. Assert `stable` bucket is **not dirty** — snapshot was current, no WAL replay ran, no re-upload needed.
+6. Assert `active` bucket **is dirty** — WAL replay added vid=99 which is not yet in the S3 snapshot.
+7. Search confirms both collections return the correct vectors.
+
+Without the fix (`mark_clean_after_snapshot` missing from `add_restored_bucket`), both buckets would start dirty after recovery and the first snapshot cycle would re-upload `stable` unnecessarily.
+
+---
+
 ## Key invariants tested
 
 | Property | Test(s) |
@@ -209,3 +229,4 @@ Inserts arrive in two batches with `min_dirty_vectors=5`:
 | Threshold suppresses snapshot below min vectors | `snapshot_skipped_when_dirty_vectors_below_threshold` |
 | Threshold fires snapshot at min vectors | `snapshot_fires_when_dirty_vectors_reach_threshold` |
 | Snapshot accumulates vectors until threshold met | `threshold_suppresses_snapshot_until_enough_vectors_accumulate` |
+| Bucket clean after recovery when snapshot was current | `recovered_bucket_is_clean_without_wal_replay_dirty_with_wal_replay` |

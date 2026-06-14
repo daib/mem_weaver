@@ -526,6 +526,12 @@ impl TimeBucketIndex {
         index.rebuild_lens(); // fix block.len so len()/is_empty() are correct
         index.load_manifest(&local_dir.join("manifest.json"))?;
 
+        // The restored content is already committed to S3 — mark the bucket clean so
+        // the snapshot task doesn't re-upload it unnecessarily. WAL replay that follows
+        // will call push_node, advancing write_count past clean_version and re-dirtying
+        // the bucket only if new vectors are actually inserted.
+        index.mark_clean_after_snapshot();
+
         // Register all restored vector IDs in the dedup set so that WAL replay
         // and future inserts won't create duplicate nodes for already-present vectors.
         self.known_vector_ids

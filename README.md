@@ -106,21 +106,26 @@ index.swap_in(bucket_seq).await?;
 
 Bit-perfect restore is validated: recall is identical before and after a hot→cold→hot cycle.
 
-### S3 Cold Tier
+### Blob Storage Cold Tier
 
 Cold buckets can be archived to S3 (or GCS, Azure Blob via `object_store`). On search, cold buckets are temporarily read from object storage without full restoration.
 
 ```
-s3://your-bucket/
-└── collections/
-    └── {collection}/
-        └── seq_{n}/
-            ├── arena_{n}.bin     ← arena snapshot
-            ├── levels.bin        ← node metadata
-            ├── manifest.json     ← bucket state
-            └── wal/
-                └── vectors_{timestamp}.bin  ← WAL for crash recovery
+s3://your-bucket/{BLOB_PREFIX}/
+├── catalog.json                    ← live collection registry
+└── {collection}/
+    ├── collection.json             ← index config + WAL high-water mark
+    ├── wal/
+    │   └── 00000000000000000001.wal  ← binary WAL entry (insert batch)
+    └── seq_{n}/
+        ├── bucket_meta.json        ← commit pointer → snap_{T}/
+        └── snap_{T}/
+            ├── block_0.arena       ← arena bytes + CRC32
+            ├── levels.bin          ← node IDs and level assignments
+            └── manifest.json       ← HNSW entry point and max layer
 ```
+
+See `docs/snapshot-format.md` and `docs/crash-recovery.md` for the full format specification.
 
 ---
 
@@ -156,6 +161,18 @@ Cold buckets are served from S3 by any reader node — no local state required. 
 
 This is currently in progress — see [Current Status](#current-status).
 
+### Server configuration
+
+| Variable | Default | Description |
+|---|---|---|
+| `LISTEN_ADDR` | `0.0.0.0:50051` | gRPC listen address |
+| `DATA_DIR` | `./data` | Local directory for on-disk bucket files |
+| `BLOB_BUCKET` | — | Blob storage bucket (S3/GCS/Azure); required for WAL and snapshots |
+| `BLOB_REGION` | `us-east-1` | Storage region |
+| `BLOB_PREFIX` | `mem-weaver` | Key prefix inside the bucket |
+| `WAL_UPLOAD_INTERVAL_MS` | `200` | How often the WAL uploader flushes to blob storage |
+| `SNAPSHOT_INTERVAL_SECS` | — | How often arena snapshots are taken; unset disables snapshots |
+
 ---
 
 ## gRPC API
@@ -169,7 +186,7 @@ service MemWeaver {
 
 message InsertItem {
   repeated float vector    = 1;
-  uint64         timestamp = 2;  // unix nanoseconds
+  uint64         timestamp = 2;  // unix seconds
   uint64         vector_id = 3;  // caller-assigned
 }
 
@@ -293,9 +310,13 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] Cold bucket search via temporary file read
 - [x] S3/GCS/Azure cold tier via `object_store`
 
-**Persistence:**
+**Persistence and crash recovery:**
 - [x] Metadata storage (levels.bin, manifest.json)
-- [ ] Crash recovery from S3 (WAL + snapshot)
+- [x] Periodic arena snapshots to blob storage (versioned staging, CRC32)
+- [x] Write-Ahead Log — inserts acked only after WAL entry confirmed in blob storage
+- [x] Crash recovery — restores from snapshot then replays WAL; cross-bucket consistent
+- [x] Catalog-driven recovery — only live collections restored, stale snapshots ignored
+- [x] Idempotent inserts — duplicate `vector_id` silently skipped; `BatchInsertResponse` lists accepted vectors only
 - [ ] Differential arena uploads (dirty tracking)
 
 **API:**

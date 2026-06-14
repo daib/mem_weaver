@@ -103,6 +103,7 @@ async fn recover_from_snapshots_restores_collections_and_search() {
             Some(Arc::clone(&store)),
             "test-prefix",
         );
+        let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
 
         svc.create_collection(Request::new(CreateCollectionRequest {
             collection: "vecs".into(),
@@ -293,6 +294,7 @@ async fn recover_does_not_overwrite_existing_collection() {
         ef_construction: 32,
         bucket_duration_secs: 3600,
         snapshot_at_secs: 0,
+        wal_high_seq: 0,
     };
     let prefix = ObjectPath::from("pfx/existing");
     index::upload_collection_meta(store.as_ref(), &col_meta, &prefix)
@@ -300,6 +302,7 @@ async fn recover_does_not_overwrite_existing_collection() {
         .expect("upload meta");
 
     let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
 
     // Pre-create the collection so it already exists in memory.
     use grpc::proto::mem_weaver_server::MemWeaver;
@@ -392,6 +395,7 @@ async fn create_collection_writes_catalog_and_recovery_uses_it() {
             ef_construction: 32,
             bucket_duration_secs: 3600,
             snapshot_at_secs: 0,
+            wal_high_seq: 0,
         },
         &ObjectPath::from("pfx/ghost"),
     )
@@ -466,6 +470,7 @@ async fn recover_with_empty_bucket_is_noop() {
             ef_construction: 32,
             bucket_duration_secs: 3600,
             snapshot_at_secs: 0,
+            wal_high_seq: 0,
         },
         &prefix,
     )
@@ -500,6 +505,7 @@ async fn stale_bucket_prefixes_are_deleted_after_eviction() {
 
     let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
 
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
     svc.create_collection(Request::new(CreateCollectionRequest {
         collection: "col".into(),
         dim: 4,
@@ -619,6 +625,7 @@ async fn eviction_during_snapshot_cycle_does_not_delete_snapshot_until_next_cycl
 
     let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
 
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
     svc.create_collection(Request::new(CreateCollectionRequest {
         collection: "col".into(),
         dim: 4,
@@ -738,6 +745,7 @@ async fn mid_upload_crash_leaves_previous_snapshot_intact() {
 
     let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
 
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
     svc.create_collection(Request::new(CreateCollectionRequest {
         collection: "col".into(),
         dim: 4,
@@ -879,5 +887,579 @@ async fn mid_upload_crash_leaves_previous_snapshot_intact() {
     assert_eq!(
         orphan_objects, 0,
         "orphaned snap_99999/ must be cleaned up after the next successful snapshot cycle"
+    );
+}
+
+#[tokio::test]
+async fn wal_entries_pruned_after_successful_snapshot_cycle() {
+    // After a snapshot cycle that covers all buckets, WAL entries with
+    // seq <= wal_high_seq must be deleted from blob storage. Entries inserted
+    // after the snapshot started (seq > wal_high_seq) must be kept.
+
+    let store = shared_store();
+    let data_dir = temp_dir("wal_prune");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 0,
+    }))
+    .await
+    .expect("create");
+
+    // Insert a batch — this produces WAL entries in blob storage.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 1,
+            },
+            InsertItem {
+                vector: vec![0.0, 1.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 2,
+            },
+        ],
+    }))
+    .await
+    .expect("batch_insert");
+
+    // Wait for WAL upload to complete.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Confirm WAL entries exist in blob storage before the snapshot.
+    let wal_prefix = ObjectPath::from("pfx/col");
+    let pre_snap_seqs = index::list_wal_seqs(store.as_ref(), &wal_prefix)
+        .await
+        .expect("list_wal_seqs");
+    assert!(
+        !pre_snap_seqs.is_empty(),
+        "WAL entries must exist before snapshot"
+    );
+
+    // Run a snapshot cycle. All buckets succeed → wal_high_seq is committed
+    // and WAL entries up to that seq are pruned.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // WAL entries covered by the snapshot must be gone.
+    let post_snap_seqs = index::list_wal_seqs(store.as_ref(), &wal_prefix)
+        .await
+        .expect("list_wal_seqs after snapshot");
+    assert!(
+        post_snap_seqs.is_empty(),
+        "WAL entries must be pruned after a successful snapshot cycle; \
+         remaining seqs: {post_snap_seqs:?}"
+    );
+
+    // Verify wal_high_seq in collection.json reflects the pruned high-water mark.
+    let col_meta = index::download_collection_meta(store.as_ref(), &wal_prefix)
+        .await
+        .expect("download collection.json");
+    assert!(
+        col_meta.wal_high_seq > 0,
+        "wal_high_seq must be > 0 after inserts were snapshotted, got {}",
+        col_meta.wal_high_seq
+    );
+    assert!(
+        col_meta.wal_high_seq >= pre_snap_seqs.iter().copied().max().unwrap_or(0),
+        "wal_high_seq ({}) must cover all pre-snapshot WAL entries (max seq was {})",
+        col_meta.wal_high_seq,
+        pre_snap_seqs.iter().copied().max().unwrap_or(0),
+    );
+}
+
+#[tokio::test]
+async fn wal_replay_restores_vectors_to_all_buckets_after_partial_snapshot_crash() {
+    // Verifies that WAL replay correctly routes vectors to the right time buckets
+    // after a crash. A single WAL entry can contain items for multiple buckets;
+    // recovery must route each item to the correct bucket regardless.
+    //
+    // Also verifies deduplication: vectors already captured in the snapshot are
+    // skipped during WAL replay (seen in the wal_replay_skips_duplicates_from_snapshot
+    // test indirectly), while vectors only in the WAL are inserted correctly.
+    //
+    // Crash point: after baseline snapshot + WAL upload, but before a second snapshot.
+    // wal_high_seq from the baseline snapshot is lower than the new WAL entries,
+    // so recovery replays those entries into both buckets.
+
+    let store = shared_store();
+    let data_dir = temp_dir("cross_bucket_wal");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    // bucket_duration=100: window [0,100) = seq_0, window [100,200) = seq_1.
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 100,
+    }))
+    .await
+    .expect("create");
+
+    // ── Phase 1: baseline → seq_0 only, snapshot ──────────────────────────────
+    // vid=10 goes into seq_0 (window [0,100)).
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![InsertItem {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: 10,
+        }],
+    }))
+    .await
+    .expect("baseline insert");
+
+    // Snapshot seq_0, prune its WAL entry.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    if let Some(h) = _snap_h {
+        h.abort();
+    }
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // ── Phase 2: cross-bucket inserts → WAL only, no new snapshot ─────────────
+    // Timestamps must be non-decreasing so each item lands in the right bucket:
+    //   vid=11 (t=50):  bucket_start=0, front=seq_0 (created_at=0), 0>0=false → seq_0
+    //   vid=21 (t=100): bucket_start=100 > seq_0.created_at=0 → creates seq_1
+    // Both are uploaded to the WAL but no snapshot is taken.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![0.0, 0.0, 1.0, 0.0],
+                timestamp: 50,
+                vector_id: 11,
+            },
+            InsertItem {
+                vector: vec![0.0, 0.0, 0.0, 1.0],
+                timestamp: 100,
+                vector_id: 21,
+            },
+        ],
+    }))
+    .await
+    .expect("cross-bucket inserts");
+
+    // "Crash": drop service after WAL upload (batch_insert already waited).
+    drop(_wal_h);
+    drop(svc);
+
+    // ── Phase 3: recovery ─────────────────────────────────────────────────────
+    // State in blob storage:
+    //   - Snapshot for seq_0 (vid=10 only; wal_high_seq covers only that WAL entry).
+    //   - WAL entry with vid=11 (t=50 → seq_0) and vid=21 (t=100 → new seq_1).
+    // Recovery must replay the WAL and route each item to its correct bucket.
+    let svc2 = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    svc2.recover_from_snapshots().await.expect("recover");
+
+    // Two buckets: seq_0 (restored from snapshot + WAL) and seq_1 (created by WAL).
+    assert_eq!(svc2.bucket_count("col").await, Some(2));
+
+    let query = vec![0.5, 0.5, 0.5, 0.5];
+
+    // seq_0 window [0,100): vid=10 from snapshot, vid=11 from WAL replay.
+    let mut bucket0: Vec<u64> = search_sorted(&svc2, "col", query.clone(), 4, Some((0, 100)))
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    bucket0.sort_unstable();
+    assert_eq!(bucket0, vec![10, 11], "seq_0: snapshot vid=10 + WAL vid=11");
+
+    // seq_1 window [100,200): vid=21 created by WAL replay advancing the bucket.
+    let mut bucket1: Vec<u64> = search_sorted(&svc2, "col", query.clone(), 4, Some((100, 200)))
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    bucket1.sort_unstable();
+    assert_eq!(
+        bucket1,
+        vec![21],
+        "seq_1: WAL vid=21 created new bucket during replay"
+    );
+
+    // Recovering a second time must not duplicate any vectors.
+    let svc3 = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    svc3.recover_from_snapshots().await.expect("re-recover");
+    let total = search_sorted(&svc3, "col", query.clone(), 3, None).await;
+    assert_eq!(
+        total.len(),
+        3,
+        "re-recovery must not duplicate vectors; got {total:?}"
+    );
+}
+
+#[tokio::test]
+async fn partial_snapshot_cycle_crash_deduplicates_already_snapshotted_bucket() {
+    // Constructs the partial-cycle crash state deterministically without background tasks.
+    //
+    //  1. Insert vid=10 → seq_0. WAL seq=1 uploaded.
+    //  2. SwapBucketOutToBlob seq_0 → baseline snapshot in S3 (vid=10 in snap_T1).
+    //  3. SwapBucketIn seq_0 → restore to memory; load_levels repopulates node_ids.
+    //  4. Write collection.json + catalog.json with wal_high_seq=1 (baseline covered).
+    //  5. Insert vid=11 (t=50→seq_0) and vid=21 (t=100→seq_1). WAL seq=2 uploaded.
+    //  6. SwapBucketOutToBlob seq_0 → partial-cycle snapshot in S3 (vid=10+vid=11 in snap_T2).
+    //     seq_1 and collection.json untouched → crash point.
+    //  7. Recovery:
+    //     seq_0 from snap_T2 → known_vector_ids = {10, 11}
+    //     seq_1 not in S3 → skipped
+    //     WAL seq=2: vid=11 → SKIP (dedup), vid=21 → INSERT (creates seq_1)
+    //  8. Assert seq_0 = {10, 11}, seq_1 = {21}.
+
+    let store = shared_store();
+    let data_dir = temp_dir("partial_cycle_dedup");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{
+        BatchInsertRequest, CreateCollectionRequest, InsertItem, SwapBucketInRequest,
+        SwapBucketOutToBlobRequest,
+    };
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 100,
+    }))
+    .await
+    .expect("create");
+
+    // Step 1: baseline insert → WAL seq=1
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![InsertItem {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: 10,
+        }],
+    }))
+    .await
+    .expect("baseline insert");
+
+    // Step 2: baseline snapshot — uploads seq_0 (vid=10) to snap_T1, writes bucket_meta.json
+    svc.swap_bucket_out_to_blob(Request::new(SwapBucketOutToBlobRequest {
+        collection: "col".into(),
+        bucket_seq: 0,
+    }))
+    .await
+    .expect("baseline SwapBucketOutToBlob");
+
+    // Step 3: restore seq_0; load_levels repopulates node_ids for the next snapshot
+    svc.swap_bucket_in(Request::new(SwapBucketInRequest {
+        collection: "col".into(),
+        bucket_seq: 0,
+    }))
+    .await
+    .expect("SwapBucketIn after baseline");
+
+    // Step 4: write collection.json and catalog.json with wal_high_seq=1
+    index::upload_collection_meta(
+        store.as_ref(),
+        &index::CollectionMeta {
+            version: 1,
+            dim: 4,
+            m: 4,
+            m_max0: 8,
+            ef_construction: 32,
+            bucket_duration_secs: 100,
+            snapshot_at_secs: 0,
+            wal_high_seq: 1,
+        },
+        &ObjectPath::from("pfx/col"),
+    )
+    .await
+    .expect("upload baseline collection.json");
+    index::upload_catalog(
+        store.as_ref(),
+        &index::Catalog {
+            version: 1,
+            collections: vec![index::CatalogEntry {
+                name: "col".to_string(),
+                dim: 4,
+                m: 4,
+                m_max0: 8,
+                ef_construction: 32,
+                bucket_duration_secs: 100,
+                snapshot_at_secs: 0,
+                wal_high_seq: 1,
+            }],
+        },
+        &ObjectPath::from("pfx"),
+    )
+    .await
+    .expect("upload baseline catalog.json");
+
+    // Step 5: post-baseline inserts → WAL seq=2
+    // vid=11 (t=50): bucket_start=0, front=seq_0 (created_at=0), 0>0=false → seq_0
+    // vid=21 (t=100): bucket_start=100 > seq_0.created_at=0 → creates seq_1
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![0.0, 0.0, 1.0, 0.0],
+                timestamp: 50,
+                vector_id: 11,
+            },
+            InsertItem {
+                vector: vec![0.0, 0.0, 0.0, 1.0],
+                timestamp: 100,
+                vector_id: 21,
+            },
+        ],
+    }))
+    .await
+    .expect("post-baseline inserts");
+
+    // Step 6: partial-cycle snapshot — commits seq_0 (vid=10+vid=11) as snap_T2.
+    // seq_1 and collection.json intentionally left unchanged.
+    svc.swap_bucket_out_to_blob(Request::new(SwapBucketOutToBlobRequest {
+        collection: "col".into(),
+        bucket_seq: 0,
+    }))
+    .await
+    .expect("partial-cycle SwapBucketOutToBlob");
+
+    // Step 7: crash
+    drop(_wal_h);
+    drop(svc);
+
+    // Step 8: recovery
+    let svc2 = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    svc2.recover_from_snapshots().await.expect("recover");
+    assert_eq!(svc2.bucket_count("col").await, Some(2));
+
+    let query = vec![0.5, 0.5, 0.5, 0.5];
+
+    let mut b0: Vec<u64> = search_sorted(&svc2, "col", query.clone(), 4, Some((0, 100)))
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    b0.sort_unstable();
+    assert_eq!(
+        b0,
+        vec![10, 11],
+        "seq_0: vid=10 and vid=11 from snapshot; vid=11 not re-inserted (dedup)"
+    );
+
+    let mut b1: Vec<u64> = search_sorted(&svc2, "col", query.clone(), 4, Some((100, 200)))
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    b1.sort_unstable();
+    assert_eq!(
+        b1,
+        vec![21],
+        "seq_1: created by WAL replay; vid=21 not in any snapshot so it was inserted"
+    );
+}
+
+#[tokio::test]
+async fn wal_spanning_both_buckets_after_partial_snapshot() {
+    // After snapshotting seq_0 (baseline), a batch insert adds a new vector to
+    // seq_0 AND creates seq_1 in the same request. The WAL entry contains vectors
+    // for BOTH buckets. A partial snapshot then commits only seq_0 (now containing
+    // both baseline and new vectors). seq_1 is never snapshotted.
+    //
+    // Timeline:
+    //   WAL seq=1: [(vid=10, t=0)] → seq_0 (baseline)
+    //   Snapshot seq_0 → snap_T1(vid=10). catalog.json wal_high_seq=1.
+    //   WAL seq=2: [(vid=11, t=50→seq_0), (vid=21, t=150→creates seq_1)]
+    //     seq_0 is still front when vid=11 is inserted (seq_1 doesn't exist yet).
+    //     vid=21 crosses the bucket boundary and creates seq_1.
+    //   Partial snapshot: seq_0 committed → snap_T2(vid=10, vid=11).
+    //   Crash. seq_1 never snapshotted. catalog.json stays at wal_high_seq=1.
+    //
+    // Recovery:
+    //   seq_0 from snap_T2 → known = {10, 11}
+    //   seq_1 not in S3   → skipped
+    //   WAL replay seq=2: vid=11 → SKIP (dedup, in snap_T2)
+    //                     vid=21 → INSERT (creates seq_1 during replay)
+    //   Result: seq_0={10,11}, seq_1={21}
+
+    let store = shared_store();
+    let data_dir = temp_dir("wal_both_buckets");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{
+        BatchInsertRequest, CreateCollectionRequest, InsertItem, SwapBucketInRequest,
+        SwapBucketOutToBlobRequest,
+    };
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 100,
+    }))
+    .await
+    .expect("create");
+
+    // WAL seq=1: baseline insert into seq_0 only.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![InsertItem {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: 10,
+        }],
+    }))
+    .await
+    .expect("baseline insert");
+    assert_eq!(svc.bucket_count("col").await, Some(1));
+
+    // Baseline snapshot of seq_0 (vid=10). Restore to memory so node_ids are live.
+    svc.swap_bucket_out_to_blob(Request::new(SwapBucketOutToBlobRequest {
+        collection: "col".into(),
+        bucket_seq: 0,
+    }))
+    .await
+    .expect("baseline snapshot seq_0");
+    svc.swap_bucket_in(Request::new(SwapBucketInRequest {
+        collection: "col".into(),
+        bucket_seq: 0,
+    }))
+    .await
+    .expect("restore seq_0");
+
+    // Write catalog.json with wal_high_seq=1 (baseline covered).
+    index::upload_catalog(
+        store.as_ref(),
+        &index::Catalog {
+            version: 1,
+            collections: vec![index::CatalogEntry {
+                name: "col".to_string(),
+                dim: 4,
+                m: 4,
+                m_max0: 8,
+                ef_construction: 32,
+                bucket_duration_secs: 100,
+                snapshot_at_secs: 0,
+                wal_high_seq: 1,
+            }],
+        },
+        &ObjectPath::from("pfx"),
+    )
+    .await
+    .expect("upload catalog wal_high_seq=1");
+
+    // WAL seq=2: cross-bucket batch while seq_0 is still the ONLY bucket.
+    //   vid=11 (t=50):  bucket_start=0, seq_0.created_at=0, 0>0=false → seq_0
+    //   vid=21 (t=150): bucket_start=100 > seq_0.created_at=0         → creates seq_1
+    // Both items are in the same WAL entry, spanning two different buckets.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![0.0, 0.0, 1.0, 0.0],
+                timestamp: 50,
+                vector_id: 11,
+            },
+            InsertItem {
+                vector: vec![0.0, 0.0, 0.0, 1.0],
+                timestamp: 150,
+                vector_id: 21,
+            },
+        ],
+    }))
+    .await
+    .expect("cross-bucket batch (WAL seq=2)");
+    assert_eq!(svc.bucket_count("col").await, Some(2));
+
+    // Partial snapshot: commit seq_0 (now has vid=10 + vid=11) as snap_T2.
+    // seq_1 is intentionally left without a snapshot.
+    // catalog.json stays at wal_high_seq=1 → WAL seq=2 will be replayed.
+    svc.swap_bucket_out_to_blob(Request::new(SwapBucketOutToBlobRequest {
+        collection: "col".into(),
+        bucket_seq: 0,
+    }))
+    .await
+    .expect("partial-cycle snapshot seq_0");
+
+    // Crash.
+    drop(_wal_h);
+    drop(svc);
+
+    // Recovery.
+    let svc2 = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    svc2.recover_from_snapshots().await.expect("recover");
+    assert_eq!(
+        svc2.bucket_count("col").await,
+        Some(2),
+        "seq_0 from snapshot + seq_1 created by WAL replay"
+    );
+
+    let query = vec![0.5, 0.5, 0.5, 0.5];
+
+    // seq_0: vid=10 (baseline) + vid=11 (from snap_T2). WAL replay deduped vid=11.
+    let mut b0: Vec<u64> = search_sorted(&svc2, "col", query.clone(), 4, Some((0, 100)))
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    b0.sort_unstable();
+    assert_eq!(
+        b0,
+        vec![10, 11],
+        "seq_0: vid=10 and vid=11 from snap_T2; vid=11 not re-inserted (dedup)"
+    );
+
+    // seq_1: vid=21 entirely from WAL replay (no seq_1 snapshot existed).
+    let mut b1: Vec<u64> = search_sorted(&svc2, "col", query.clone(), 4, Some((100, 200)))
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    b1.sort_unstable();
+    assert_eq!(
+        b1,
+        vec![21],
+        "seq_1: created during WAL replay; vid=21 from WAL (no snapshot for seq_1)"
     );
 }

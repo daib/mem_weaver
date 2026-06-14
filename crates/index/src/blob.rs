@@ -34,6 +34,201 @@ pub struct CollectionMeta {
     pub bucket_duration_secs: u64,
     /// Unix timestamp (seconds) when this snapshot was written.
     pub snapshot_at_secs: u64,
+    /// Highest WAL sequence number whose insert was already applied to the index
+    /// at the time this snapshot was taken. Recovery must replay only WAL entries
+    /// with `seq > wal_high_seq` to avoid re-inserting already-snapshotted vectors.
+    pub wal_high_seq: u64,
+}
+
+/// One insert item recorded in the WAL.
+#[derive(Debug, Clone)]
+pub struct WalItem {
+    pub vector: Vec<f32>,
+    pub timestamp: u64,
+    pub vector_id: u64,
+}
+
+/// A WAL entry written for each [`BatchInsert`] call. Stored at
+/// `<prefix>/wal/<seq_padded>.wal` in a compact binary format.
+///
+/// Binary layout (all little-endian):
+/// ```text
+/// seq        : u64
+/// item_count : u32
+/// items[]:
+///   vector_len : u32
+///   vector     : [f32; vector_len]
+///   timestamp  : u64
+///   vector_id  : u64
+/// crc32      : u32   ← CRC32 of all preceding bytes
+/// ```
+#[derive(Debug, Clone)]
+pub struct WalEntry {
+    /// Monotonically increasing per-collection sequence number.
+    pub seq: u64,
+    pub items: Vec<WalItem>,
+}
+
+/// Encode a [`WalEntry`] to the compact binary WAL format.
+pub fn encode_wal_entry(entry: &WalEntry) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&entry.seq.to_le_bytes());
+    buf.extend_from_slice(&(entry.items.len() as u32).to_le_bytes());
+    for item in &entry.items {
+        buf.extend_from_slice(&(item.vector.len() as u32).to_le_bytes());
+        for &f in &item.vector {
+            buf.extend_from_slice(&f.to_le_bytes());
+        }
+        buf.extend_from_slice(&item.timestamp.to_le_bytes());
+        buf.extend_from_slice(&item.vector_id.to_le_bytes());
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&buf);
+    buf.extend_from_slice(&hasher.finalize().to_le_bytes());
+    buf
+}
+
+/// Decode a [`WalEntry`] from the binary WAL format, validating the CRC32.
+pub fn decode_wal_entry(bytes: &[u8]) -> io::Result<WalEntry> {
+    if bytes.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WAL entry too small",
+        ));
+    }
+    let (payload, crc_bytes) = bytes.split_at(bytes.len() - 4);
+    let stored_crc = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(payload);
+    let computed_crc = hasher.finalize();
+    if computed_crc != stored_crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("WAL CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"),
+        ));
+    }
+
+    macro_rules! read_u32 {
+        ($pos:expr) => {{
+            if $pos + 4 > payload.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected EOF"));
+            }
+            let v = u32::from_le_bytes(payload[$pos..$pos + 4].try_into().unwrap());
+            $pos += 4;
+            v
+        }};
+    }
+    macro_rules! read_u64 {
+        ($pos:expr) => {{
+            if $pos + 8 > payload.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected EOF"));
+            }
+            let v = u64::from_le_bytes(payload[$pos..$pos + 8].try_into().unwrap());
+            $pos += 8;
+            v
+        }};
+    }
+
+    let mut pos = 0usize;
+    let seq = read_u64!(pos);
+    let item_count = read_u32!(pos) as usize;
+    let mut items = Vec::with_capacity(item_count);
+    for _ in 0..item_count {
+        let vlen = read_u32!(pos) as usize;
+        if pos + vlen * 4 > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected EOF in vector",
+            ));
+        }
+        let mut vector = Vec::with_capacity(vlen);
+        for _ in 0..vlen {
+            vector.push(f32::from_le_bytes(
+                payload[pos..pos + 4].try_into().unwrap(),
+            ));
+            pos += 4;
+        }
+        let timestamp = read_u64!(pos);
+        let vector_id = read_u64!(pos);
+        items.push(WalItem {
+            vector,
+            timestamp,
+            vector_id,
+        });
+    }
+    Ok(WalEntry { seq, items })
+}
+
+/// Upload raw WAL bytes to `<prefix>/wal/<seq_padded>.wal` in `store`.
+/// The bytes must already be in the binary WAL format produced by [`encode_wal_entry`].
+pub async fn upload_wal_bytes(
+    store: &dyn ObjectStore,
+    seq: u64,
+    bytes: Bytes,
+    prefix: &ObjectPath,
+) -> io::Result<()> {
+    let remote = prefix.child("wal").child(format!("{seq:020}.wal"));
+    store
+        .put(&remote, PutPayload::from(bytes))
+        .await
+        .map_err(to_io)
+        .map(|_| ())
+}
+
+/// List all WAL sequence numbers present at `<prefix>/wal/` in `store`, sorted ascending.
+pub async fn list_wal_seqs(store: &dyn ObjectStore, prefix: &ObjectPath) -> io::Result<Vec<u64>> {
+    let wal_prefix = prefix.child("wal");
+    let result = store
+        .list_with_delimiter(Some(&wal_prefix))
+        .await
+        .map_err(to_io)?;
+    let mut seqs: Vec<u64> = result
+        .objects
+        .iter()
+        .filter_map(|obj| {
+            obj.location
+                .filename()?
+                .strip_suffix(".wal")?
+                .parse::<u64>()
+                .ok()
+        })
+        .collect();
+    seqs.sort_unstable();
+    Ok(seqs)
+}
+
+/// Download the WAL entry with `seq` from `<prefix>/wal/<seq_padded>.wal` and decode it.
+pub async fn download_wal_entry(
+    store: &dyn ObjectStore,
+    prefix: &ObjectPath,
+    seq: u64,
+) -> io::Result<WalEntry> {
+    let remote = prefix.child("wal").child(format!("{seq:020}.wal"));
+    let bytes = store
+        .get(&remote)
+        .await
+        .map_err(to_io)?
+        .bytes()
+        .await
+        .map_err(to_io)?;
+    decode_wal_entry(&bytes)
+}
+
+/// Delete all WAL entries at `<prefix>/wal/` with `seq <= max_seq`.
+/// Used after a snapshot to prune entries that are now covered.
+pub async fn delete_wal_entries_up_to(
+    store: &dyn ObjectStore,
+    prefix: &ObjectPath,
+    max_seq: u64,
+) -> io::Result<usize> {
+    let seqs = list_wal_seqs(store, prefix).await?;
+    let mut deleted = 0;
+    for seq in seqs.into_iter().take_while(|&s| s <= max_seq) {
+        let remote = prefix.child("wal").child(format!("{seq:020}.wal"));
+        store.delete(&remote).await.map_err(to_io)?;
+        deleted += 1;
+    }
+    Ok(deleted)
 }
 
 /// Per-bucket metadata stored at `<prefix>/seq_<N>/bucket_meta.json`.
@@ -65,6 +260,9 @@ pub struct CatalogEntry {
     pub bucket_duration_secs: u64,
     /// Unix timestamp (seconds) when this catalog entry was last written.
     pub snapshot_at_secs: u64,
+    /// Highest WAL sequence number whose insert was already applied to the index
+    /// at the time the catalog was written.
+    pub wal_high_seq: u64,
 }
 
 /// Registry of live collections, stored at `<prefix>/catalog.json`.

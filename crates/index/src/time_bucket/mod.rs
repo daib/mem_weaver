@@ -181,6 +181,16 @@ impl TimeBucketIndex {
         self.buckets.iter().map(|b| (b.seq, b.created_at)).collect()
     }
 
+    /// Total number of vectors inserted across all buckets since their last snapshot.
+    /// Used to decide whether the collection has accumulated enough dirty vectors to
+    /// justify a snapshot cycle.
+    pub fn total_dirty_vector_count(&self) -> u64 {
+        self.buckets
+            .iter()
+            .map(|b| b.index.dirty_vector_count())
+            .sum()
+    }
+
     /// Returns `true` if the bucket identified by `seq` has any arena blocks that
     /// have been written to since the last successful snapshot upload. Returns `false`
     /// if the bucket is not found, has no in-memory blocks, or all blocks are clean.

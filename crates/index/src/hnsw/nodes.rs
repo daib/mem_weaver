@@ -652,6 +652,12 @@ impl ArenaNodeStore {
         self.write_count
     }
 
+    /// Number of vectors inserted since the last successful snapshot upload
+    /// (`write_count - clean_version`).
+    pub fn dirty_vector_count(&self) -> u64 {
+        self.write_count.saturating_sub(self.clean_version)
+    }
+
     /// Mark the store clean only if no writes have occurred since `version` was
     /// captured. If `write_count` has advanced, a concurrent insert arrived during
     /// the upload and the store must remain dirty for re-upload on the next cycle.
@@ -921,6 +927,11 @@ pub trait HnswNodeStore {
     /// Capture under the same read lock as the snapshot, pass to
     /// [`mark_clean_if_version`] after a successful upload. Default: `0`.
     fn write_count(&self) -> u64 {
+        0
+    }
+    /// Number of vectors inserted since the last successful snapshot upload.
+    /// Default: `0`.
+    fn dirty_vector_count(&self) -> u64 {
         0
     }
     /// Mark all blocks as clean after a successful snapshot upload. Default: no-op.
@@ -1219,6 +1230,10 @@ impl HnswNodeStore for ArenaNodeStore {
 
     fn write_count(&self) -> u64 {
         ArenaNodeStore::write_count(self)
+    }
+
+    fn dirty_vector_count(&self) -> u64 {
+        ArenaNodeStore::dirty_vector_count(self)
     }
 
     fn mark_all_clean(&mut self) {

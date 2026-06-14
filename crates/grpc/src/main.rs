@@ -14,7 +14,8 @@
 //!   WAL_UPLOAD_INTERVAL_MS upload pending WAL entries every N ms (default: 200)
 //!
 //! Periodic snapshots (requires blob storage to be configured):
-//!   SNAPSHOT_INTERVAL_SECS snapshot every N seconds; unset disables snapshots
+//!   SNAPSHOT_INTERVAL_SECS      snapshot every N seconds; unset disables snapshots
+//!   SNAPSHOT_MIN_DIRTY_VECTORS  minimum dirty vectors before a snapshot fires (default: 0)
 //!
 //! Collections are created at runtime via the CreateCollection RPC.
 
@@ -75,7 +76,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(interval) = snapshot_interval {
-        match service.spawn_snapshot_task(SnapshotConfig { interval }) {
+        let min_dirty_vectors: u64 = std::env::var("SNAPSHOT_MIN_DIRTY_VECTORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        match service.spawn_snapshot_task(SnapshotConfig { interval, min_dirty_vectors }) {
             Some(_) => eprintln!(
                 "mem-weaver-server: snapshot task started (interval={}s)",
                 interval.as_secs()

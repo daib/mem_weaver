@@ -172,6 +172,7 @@ This is currently in progress — see [Current Status](#current-status).
 | `BLOB_PREFIX` | `mem-weaver` | Key prefix inside the bucket |
 | `WAL_UPLOAD_INTERVAL_MS` | `200` | How often the WAL uploader flushes to blob storage |
 | `SNAPSHOT_INTERVAL_SECS` | — | How often arena snapshots are taken; unset disables snapshots |
+| `SNAPSHOT_MIN_DIRTY_VECTORS` | `0` | Minimum new vectors per collection before a snapshot fires; `0` = always snapshot dirty buckets. WAL replay is cheap for small counts — a value around `10000` avoids frequent small uploads while still bounding recovery time |
 
 ---
 

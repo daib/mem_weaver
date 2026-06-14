@@ -71,8 +71,13 @@ impl WalState {
 
 /// Configuration for the periodic arena snapshot task.
 pub struct SnapshotConfig {
-    /// How often to take a snapshot of every in-memory bucket across all collections.
+    /// How often to check for dirty buckets.
     pub interval: Duration,
+    /// Minimum total number of dirty vectors across all buckets in a collection before
+    /// a snapshot cycle is triggered. Set to `0` (default) to snapshot on every cycle
+    /// whenever any bucket is dirty. Use a higher value (e.g. 1000) to avoid frequent
+    /// small snapshots in low-throughput workloads.
+    pub min_dirty_vectors: u64,
 }
 
 pub mod proto {
@@ -203,10 +208,6 @@ impl MemWeaverService {
         self.data_dir.join(collection).join("wal")
     }
 
-    fn wal_blob_prefix(&self, collection: &str) -> ObjectPath {
-        self.blob_prefix.child(collection)
-    }
-
     fn get_or_create_wal(&self, collection: &str, start_seq: u64) -> Arc<WalState> {
         let mut map = self.wal_states.lock().expect("wal_states lock");
         map.entry(collection.to_owned())
@@ -272,11 +273,21 @@ impl MemWeaverService {
                 for (col_name, col) in col_map {
                     let col_prefix = blob_prefix.child(col_name.as_str());
 
-                    // Read config and bucket list under a single read lock.
-                    let (col_config, bucket_metas) = {
+                    // Read config, bucket list, and total dirty vector count together.
+                    let (col_config, bucket_metas, total_dirty) = {
                         let idx = col.read().await;
-                        (idx.config(), idx.bucket_metas())
+                        (
+                            idx.config(),
+                            idx.bucket_metas(),
+                            idx.total_dirty_vector_count(),
+                        )
                     };
+
+                    // Skip this collection if it hasn't accumulated enough dirty vectors.
+                    // This avoids frequent tiny snapshots in low-throughput workloads.
+                    if config.min_dirty_vectors > 0 && total_dirty < config.min_dirty_vectors {
+                        continue;
+                    }
 
                     let (dim, m, m_max0, ef_construction, bucket_duration) = col_config;
                     // Snapshot the WAL high-water mark now. collection.json is only

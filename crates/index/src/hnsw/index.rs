@@ -34,6 +34,8 @@ pub trait HnswIndex {
     /// Returns the write count at the time of the snapshot. Capture under the same
     /// read lock as the snapshot and pass to [`mark_clean_after_snapshot_if_version`].
     fn snapshot_write_count(&self) -> u64;
+    /// Number of vectors inserted since the last successful snapshot upload.
+    fn dirty_vector_count(&self) -> u64;
     /// Mark all arena blocks as clean after a successful snapshot upload, but only if
     /// no writes have occurred since `version` was captured. This prevents clearing
     /// dirty on blocks that were written between the snapshot and the upload completion.
@@ -175,6 +177,10 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
 
     fn snapshot_write_count(&self) -> u64 {
         self.graph.write_count()
+    }
+
+    fn dirty_vector_count(&self) -> u64 {
+        self.graph.dirty_vector_count()
     }
 
     fn mark_clean_after_snapshot_if_version(&mut self, version: u64) {

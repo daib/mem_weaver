@@ -18,9 +18,13 @@ Background tasks
     Scans local WAL dir, uploads pending entries to blob storage,
     signals waiting inserts, removes local files.
 
-  Snapshot task  (SNAPSHOT_INTERVAL_SECS)
+  Snapshot task  (SNAPSHOT_INTERVAL_SECS, SNAPSHOT_MIN_DIRTY_VECTORS)
     Each arena block carries a dirty flag. Only buckets with dirty blocks
     are uploaded; cold buckets (no new inserts since last upload) are skipped.
+    If the total dirty vectors across all buckets is below SNAPSHOT_MIN_DIRTY_VECTORS,
+    the entire cycle is skipped — WAL replay is cheap for small counts (~ms for
+    thousands of vectors) while S3 uploads are expensive. A threshold around
+    10 000 is recommended; set to 0 to always upload whenever any bucket is dirty.
     Only after ALL buckets either succeed or are confirmed clean:
     writes wal_high_seq to collection.json and prunes WAL entries.
 

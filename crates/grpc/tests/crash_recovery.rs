@@ -1463,3 +1463,255 @@ async fn wal_spanning_both_buckets_after_partial_snapshot() {
         "seq_1: created during WAL replay; vid=21 from WAL (no snapshot for seq_1)"
     );
 }
+
+#[tokio::test]
+async fn dirty_bucket_uploaded_clean_bucket_skipped() {
+    // Verifies the dirty-tracking integration with real blob storage uploads:
+    //
+    //  1. Insert vectors → bucket dirty → snapshot cycle uploads it → bucket clean.
+    //  2. Multiple snapshot cycles pass with no new inserts → snap_dir unchanged
+    //     (clean bucket is skipped, no redundant upload).
+    //  3. Insert new vectors → bucket dirty → next snapshot cycle uploads it →
+    //     snap_dir advances to a new value.
+
+    let store = shared_store();
+    let data_dir = temp_dir("dirty_tracking");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 0,
+    }))
+    .await
+    .expect("create");
+
+    // Insert baseline vectors → bucket is dirty.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![
+            InsertItem {
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 1,
+            },
+            InsertItem {
+                vector: vec![0.0, 1.0, 0.0, 0.0],
+                timestamp: 0,
+                vector_id: 2,
+            },
+        ],
+    }))
+    .await
+    .expect("baseline insert");
+
+    // Run snapshot cycles until the bucket is uploaded and marked clean.
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Read the snap_dir committed by the first upload.
+    let seq0_prefix = ObjectPath::from("pfx/col/seq_0");
+    let meta_after_first_upload = index::download_bucket_meta(store.as_ref(), &seq0_prefix)
+        .await
+        .expect("bucket_meta.json must exist after first snapshot");
+    let snap_dir_first = meta_after_first_upload.snap_dir.clone();
+    assert!(
+        snap_dir_first.starts_with("snap_"),
+        "snap_dir must be versioned"
+    );
+
+    // Let many more snapshot cycles run with NO new inserts.
+    // If dirty tracking works, the bucket is clean and these cycles are no-ops.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta_after_clean_cycles = index::download_bucket_meta(store.as_ref(), &seq0_prefix)
+        .await
+        .expect("bucket_meta.json");
+    assert_eq!(
+        meta_after_clean_cycles.snap_dir, snap_dir_first,
+        "snap_dir must not change when bucket is clean — redundant upload would create a new snap_T"
+    );
+
+    // Insert new vectors → bucket becomes dirty again.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![InsertItem {
+            vector: vec![0.0, 0.0, 1.0, 0.0],
+            timestamp: 0,
+            vector_id: 3,
+        }],
+    }))
+    .await
+    .expect("second insert");
+
+    // Give the snapshot task time to detect the dirty bucket and upload it.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let meta_after_dirty_upload = index::download_bucket_meta(store.as_ref(), &seq0_prefix)
+        .await
+        .expect("bucket_meta.json");
+    assert_ne!(
+        meta_after_dirty_upload.snap_dir, snap_dir_first,
+        "snap_dir must advance after a new insert dirtied the bucket"
+    );
+
+    // Verify search returns all three vectors after the full lifecycle.
+    use grpc::proto::SearchRequest;
+    let hits = svc
+        .search(Request::new(SearchRequest {
+            collection: "col".into(),
+            query: vec![0.5, 0.5, 0.5, 0.5],
+            k: 3,
+            ef: 64,
+            time_range_start: None,
+            time_range_end: None,
+        }))
+        .await
+        .expect("search")
+        .into_inner()
+        .hits;
+    let mut ids: Vec<u64> = hits.iter().map(|h| h.vector_id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 2, 3], "all three vectors must be searchable");
+}
+
+#[tokio::test]
+async fn dirty_flag_race_condition_stale_version_leaves_bucket_dirty_for_reupload() {
+    // Simulates the race where a new vector arrives between the snapshot being taken
+    // and mark_clean_if_version being called. With a stale version, the bucket must
+    // stay dirty and be re-uploaded on the next cycle so the new vector reaches S3.
+    //
+    // Race timeline:
+    //   write_count_before = bucket_write_count(seq=0)   ← simulates "snapshot taken"
+    //   insert vid=2                                      ← "write during upload"
+    //   mark_bucket_clean_if_version(seq=0, version=before) → bucket stays dirty
+    //   snapshot cycle runs                               → bucket re-uploaded with vid=2
+    //   crash + recovery                                  → both vid=1 and vid=2 found
+
+    let store = shared_store();
+    let data_dir = temp_dir("race_condition");
+    let _guard = DirGuard(data_dir.clone());
+
+    use grpc::proto::mem_weaver_server::MemWeaver;
+    use grpc::proto::{BatchInsertRequest, CreateCollectionRequest, InsertItem};
+    use object_store::path::Path as ObjectPath;
+    use tonic::Request;
+
+    let svc = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    let _wal_h = svc.spawn_wal_upload_task(Duration::from_millis(1));
+
+    svc.create_collection(Request::new(CreateCollectionRequest {
+        collection: "col".into(),
+        dim: 4,
+        m: 4,
+        m_max0: 8,
+        ef_construction: 32,
+        bucket_duration_secs: 0,
+    }))
+    .await
+    .expect("create");
+
+    // Insert vid=1 → bucket is dirty.
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![InsertItem {
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: 1,
+        }],
+    }))
+    .await
+    .expect("insert vid=1");
+
+    // ── Simulate: snapshot task captures write_count under read lock ──────────
+    let write_count_before = svc.bucket_write_count("col", 0).await;
+
+    // ── Simulate: new vector inserted during the upload (no lock held) ────────
+    svc.batch_insert(Request::new(BatchInsertRequest {
+        collection: "col".into(),
+        items: vec![InsertItem {
+            vector: vec![0.0, 1.0, 0.0, 0.0],
+            timestamp: 0,
+            vector_id: 2,
+        }],
+    }))
+    .await
+    .expect("insert vid=2 (concurrent with upload)");
+
+    let write_count_after = svc.bucket_write_count("col", 0).await;
+    assert!(
+        write_count_after > write_count_before,
+        "insert must advance write_count"
+    );
+
+    // ── Simulate: upload completes, mark_clean called with stale version ──────
+    // The stale version means the bucket stays dirty — the race is detected.
+    svc.mark_bucket_clean_if_version("col", 0, write_count_before)
+        .await;
+
+    assert!(
+        svc.is_bucket_dirty_test("col", 0).await,
+        "bucket must stay dirty when mark_clean used a stale version"
+    );
+
+    // ── Snapshot cycle runs, sees dirty bucket, re-uploads with both vectors ──
+    let _snap_h = svc.spawn_snapshot_task(grpc::SnapshotConfig {
+        interval: Duration::from_millis(1),
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Bucket should now be clean (version-aware mark_clean succeeded this time).
+    assert!(
+        !svc.is_bucket_dirty_test("col", 0).await,
+        "bucket must be clean after snapshot cycle with matching version"
+    );
+
+    // ── Record the snap_dir that contains both vectors ────────────────────────
+    let meta = index::download_bucket_meta(store.as_ref(), &ObjectPath::from("pfx/col/seq_0"))
+        .await
+        .expect("bucket_meta.json");
+    let snap_dir_with_both = meta.snap_dir.clone();
+
+    // Let more cycles run — clean bucket must not be re-uploaded.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let meta2 = index::download_bucket_meta(store.as_ref(), &ObjectPath::from("pfx/col/seq_0"))
+        .await
+        .expect("bucket_meta.json");
+    assert_eq!(
+        meta2.snap_dir, snap_dir_with_both,
+        "clean bucket must not be re-uploaded"
+    );
+
+    // ── Crash and recover: both vectors must be present ───────────────────────
+    drop(_snap_h);
+    drop(_wal_h);
+    drop(svc);
+
+    let svc2 = MemWeaverService::with_storage(data_dir.clone(), Some(Arc::clone(&store)), "pfx");
+    svc2.recover_from_snapshots().await.expect("recover");
+
+    let mut ids: Vec<u64> = search_sorted(&svc2, "col", vec![0.5, 0.5, 0.5, 0.5], 2, None)
+        .await
+        .iter()
+        .map(|&(vid, _)| vid)
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(
+        ids,
+        vec![1, 2],
+        "both vectors must survive crash — vid=2 was re-uploaded because dirty flag was preserved"
+    );
+}

@@ -184,7 +184,7 @@ HNSW index entry point and depth, required to resume search after recovery.
 
 Two paths produce snapshots in this format:
 
-- **Snapshot task** (`SNAPSHOT_INTERVAL_SECS`) — periodic background task that copies every in-memory bucket to blob storage without changing memory state.
+- **Snapshot task** (`SNAPSHOT_INTERVAL_SECS`) — periodic background task. Only buckets with **dirty** arena blocks (written to since the last successful upload) are re-snapshotted. Clean buckets are skipped and their previous snapshot remains valid. After a successful upload, all blocks in that bucket are marked clean.
 - **`SwapBucketOutToBlob` RPC** — explicit operator-driven eviction that writes the bucket to local disk first, then uploads using the same versioned `snap_T/` + `bucket_meta.json` layout. Files written by this RPC are interchangeable with snapshot-task output and are visible to crash recovery.
 
 `SwapBucketInFromBlob` is the inverse: it reads `bucket_meta.json` to locate the versioned `snap_T/` directory and downloads from there.
@@ -200,7 +200,9 @@ Two paths produce snapshots in this format:
 
 ## Snapshot lifecycle
 
+- **Dirty tracking** — each arena block carries a `dirty` flag and the store maintains a monotonic `write_count`. New blocks start dirty. `push_node` marks the block dirty and increments `write_count`. Loading a block from disk (`swap_in`, `swap_in_from`) marks it clean. A bucket is skipped entirely if none of its blocks are dirty — the previous snapshot is still valid. Cold buckets (no new inserts) generate zero uploads per cycle.
+- **Race-safe mark-clean** — the snapshot task captures `write_count` under the same read lock used to take the snapshot. After a successful upload it calls `mark_clean_if_version(captured_count)`: if new vectors were inserted during the upload (advancing `write_count`), the version check fails and the dirty flag is left set, ensuring the next cycle re-uploads the updated arena. This closes the race between snapshot completion and the mark-clean call.
 - **Versioned staging** — new snapshot files are uploaded to `seq_<N>/snap_<T>/` before the commit pointer (`bucket_meta.json`) is updated. The previous complete snapshot in `snap_<T-1>/` is untouched during the upload and only deleted after the new commit succeeds.
-- **Written**: once per `SNAPSHOT_INTERVAL_SECS` for every in-memory bucket.
-- **Crash safety**: each file PUT is atomic. If the process crashes mid-upload, `bucket_meta.json` still points to the old `snap_<T-1>/`, which is fully consistent. The incomplete `snap_<T>/` is an orphan that will be cleaned up on the next successful cycle. If no prior `bucket_meta.json` exists (first snapshot never completed), the bucket is skipped during recovery.
-- **Deleted**: after a successful cycle, the previous `snap_*/` directory for each bucket is removed. Any `seq_<N>/` prefix whose seq is no longer tracked by the index is deleted entirely. Deletion only runs when all live buckets were successfully re-snapshotted in the same cycle.
+- **Written**: once per `SNAPSHOT_INTERVAL_SECS`, but **only for dirty buckets**. The hot bucket (receiving new inserts) is re-uploaded every cycle; cold buckets are skipped.
+- **Crash safety**: each file PUT is atomic. If the process crashes mid-upload, `bucket_meta.json` still points to the old `snap_<T-1>/`, which is fully consistent. The incomplete `snap_<T>/` is an orphan cleaned up on the next cycle — even if the bucket is clean (no new upload needed), the orphan cleanup still runs when checking the bucket's current pointer.
+- **Deleted**: after a successful cycle, the previous `snap_*/` directory for each bucket is removed. Any `seq_<N>/` prefix whose seq is no longer tracked by the index is deleted entirely. Deletion only runs when all live buckets were either successfully re-snapshotted or confirmed clean in the same cycle.

@@ -317,7 +317,7 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] Crash recovery — restores from snapshot then replays WAL; cross-bucket consistent
 - [x] Catalog-driven recovery — only live collections restored, stale snapshots ignored
 - [x] Idempotent inserts — duplicate `vector_id` silently skipped; `BatchInsertResponse` lists accepted vectors only
-- [ ] Differential arena uploads (dirty tracking)
+- [x] Dirty-block tracking — only modified arena blocks are re-uploaded; cold buckets skipped entirely
 
 **API:**
 - [x] gRPC API (BatchInsert, Search, CreateCollection)

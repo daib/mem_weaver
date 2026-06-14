@@ -181,6 +181,47 @@ impl TimeBucketIndex {
         self.buckets.iter().map(|b| (b.seq, b.created_at)).collect()
     }
 
+    /// Returns `true` if the bucket identified by `seq` has any arena blocks that
+    /// have been written to since the last successful snapshot upload. Returns `false`
+    /// if the bucket is not found, has no in-memory blocks, or all blocks are clean.
+    pub fn is_bucket_dirty(&self, seq: BucketSeq) -> bool {
+        self.buckets
+            .iter()
+            .find(|b| b.seq == seq)
+            .map(|b| b.index.has_dirty_blocks())
+            .unwrap_or(false)
+    }
+
+    /// Returns the write count for bucket `seq` at the current instant.
+    /// Capture this under the same read lock used to take the snapshot, then pass
+    /// to [`mark_bucket_clean_if_version`] after a successful upload.
+    pub fn bucket_write_count(&self, seq: BucketSeq) -> u64 {
+        self.buckets
+            .iter()
+            .find(|b| b.seq == seq)
+            .map(|b| b.index.snapshot_write_count())
+            .unwrap_or(0)
+    }
+
+    /// Mark all arena blocks in bucket `seq` as clean, but only if the write count
+    /// matches `version`. If new vectors were inserted between the snapshot and the
+    /// upload completion, the count will have advanced and the flag is left dirty so
+    /// the next cycle re-uploads the updated arena.
+    pub fn mark_bucket_clean_if_version(&mut self, seq: BucketSeq, version: u64) {
+        if let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) {
+            bucket.index.mark_clean_after_snapshot_if_version(version);
+        }
+    }
+
+    /// Mark all arena blocks in the bucket identified by `seq` as clean.
+    /// Called after a successful snapshot upload so the next cycle can skip
+    /// buckets with no new inserts.
+    pub fn mark_bucket_clean(&mut self, seq: BucketSeq) {
+        if let Some(bucket) = self.buckets.iter_mut().find(|b| b.seq == seq) {
+            bucket.index.mark_clean_after_snapshot();
+        }
+    }
+
     /// Returns the grid-aligned creation timestamp of the bucket with `seq`, or
     /// `None` if no such bucket exists.
     pub fn bucket_created_at(&self, seq: BucketSeq) -> Option<Timestamp> {
@@ -1609,6 +1650,65 @@ mod tests {
         assert_eq!(
             after, before,
             "search must match baseline after snapshot → S3 → restore round-trip"
+        );
+    }
+
+    // ── dirty-flag race condition fix ─────────────────────────────────────────
+
+    /// Simulates the race: snapshot captured at version N, new insert arrives
+    /// during the upload (version advances to N+1), then mark_clean_if_version(N)
+    /// is called. The bucket must stay dirty so the next cycle re-uploads.
+    #[test]
+    fn mark_clean_if_version_leaves_dirty_when_write_happened_after_snapshot() {
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0), 0u64).unwrap();
+        let seq = BucketSeq(0);
+
+        assert!(idx.is_bucket_dirty(seq), "new bucket must start dirty");
+
+        // ── Simulate: snapshot taken, version captured ────────────────────────
+        let version_at_snapshot = idx.bucket_write_count(seq);
+
+        // ── Simulate: new insert arrives during the upload (no lock held) ─────
+        idx.insert(&[2.0; 4], ts(0), 1u64).unwrap();
+
+        let version_after_insert = idx.bucket_write_count(seq);
+        assert!(
+            version_after_insert > version_at_snapshot,
+            "insert must advance write_count"
+        );
+
+        // ── Simulate: upload completes, stale version passed to mark_clean ────
+        idx.mark_bucket_clean_if_version(seq, version_at_snapshot);
+
+        assert!(
+            idx.is_bucket_dirty(seq),
+            "bucket must stay dirty — write happened after snapshot was taken"
+        );
+    }
+
+    /// Verifies the happy path: when no writes occur between snapshot and upload,
+    /// mark_clean_if_version correctly clears the dirty flag.
+    #[test]
+    fn mark_clean_if_version_clears_flag_when_no_write_happened_after_snapshot() {
+        let mut idx = make_index(10);
+        idx.insert(&[1.0; 4], ts(0), 0u64).unwrap();
+        let seq = BucketSeq(0);
+
+        // Capture version and immediately mark clean (no intervening writes).
+        let version = idx.bucket_write_count(seq);
+        idx.mark_bucket_clean_if_version(seq, version);
+
+        assert!(
+            !idx.is_bucket_dirty(seq),
+            "bucket must be clean when no write happened after snapshot"
+        );
+
+        // A subsequent insert re-dirties the bucket for the next cycle.
+        idx.insert(&[2.0; 4], ts(0), 1u64).unwrap();
+        assert!(
+            idx.is_bucket_dirty(seq),
+            "insert after mark_clean must re-dirty the bucket"
         );
     }
 }

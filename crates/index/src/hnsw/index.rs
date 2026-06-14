@@ -28,6 +28,19 @@ pub trait HnswIndex {
     /// [`load_levels`]. Must be called after both [`load_blocks_from_dir`] and
     /// [`load_levels`] so that `len()` / `is_empty()` return correct values.
     fn rebuild_lens(&mut self);
+    /// Returns `true` if any arena block has been written to since the last successful
+    /// snapshot upload. Always `false` for non-arena indexes.
+    fn has_dirty_blocks(&self) -> bool;
+    /// Returns the write count at the time of the snapshot. Capture under the same
+    /// read lock as the snapshot and pass to [`mark_clean_after_snapshot_if_version`].
+    fn snapshot_write_count(&self) -> u64;
+    /// Mark all arena blocks as clean after a successful snapshot upload, but only if
+    /// no writes have occurred since `version` was captured. This prevents clearing
+    /// dirty on blocks that were written between the snapshot and the upload completion.
+    fn mark_clean_after_snapshot_if_version(&mut self, version: u64);
+    /// Mark all arena blocks as clean unconditionally. Prefer
+    /// [`mark_clean_after_snapshot_if_version`] where possible.
+    fn mark_clean_after_snapshot(&mut self);
     /// Copy in-memory arena blocks to `dir` without changing storage state. Returns the
     /// number of blocks written. Output format matches [`swap_out`], so the files can be
     /// uploaded to S3 and later restored via [`swap_in_from`]. No-op for non-arena indexes.
@@ -154,6 +167,22 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
 
     fn rebuild_lens(&mut self) {
         self.graph.rebuild_lens_from_node_ids(&self.node_ids);
+    }
+
+    fn has_dirty_blocks(&self) -> bool {
+        self.graph.has_dirty_blocks()
+    }
+
+    fn snapshot_write_count(&self) -> u64 {
+        self.graph.write_count()
+    }
+
+    fn mark_clean_after_snapshot_if_version(&mut self, version: u64) {
+        self.graph.mark_clean_if_version(version);
+    }
+
+    fn mark_clean_after_snapshot(&mut self) {
+        self.graph.mark_all_clean();
     }
 
     fn snapshot_to_dir(&self, dir: &std::path::Path) -> std::io::Result<usize> {

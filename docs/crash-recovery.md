@@ -19,9 +19,10 @@ Background tasks
     signals waiting inserts, removes local files.
 
   Snapshot task  (SNAPSHOT_INTERVAL_SECS)
-    Copies in-memory arenas to blob storage (one bucket at a time).
-    Only after ALL buckets succeed: writes wal_high_seq to collection.json
-    and prunes WAL entries covered by the snapshot.
+    Each arena block carries a dirty flag. Only buckets with dirty blocks
+    are uploaded; cold buckets (no new inserts since last upload) are skipped.
+    Only after ALL buckets either succeed or are confirmed clean:
+    writes wal_high_seq to collection.json and prunes WAL entries.
 
 Recovery (on startup, before gRPC server opens)
 ───────────────────────────────────────────────────────────────────────

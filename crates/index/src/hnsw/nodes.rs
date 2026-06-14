@@ -625,6 +625,13 @@ pub struct ArenaNodeStore {
     m: usize,
     m_max0: usize,
     blocks: Vec<NodeBlock>,
+    /// Monotonically increasing counter, incremented on every successful `push_node`.
+    /// Starts at 1 so a freshly created store is immediately dirty
+    /// (`write_count > clean_version = 0`) and will be uploaded on the first cycle.
+    write_count: u64,
+    /// The `write_count` at the time of the last successful snapshot upload.
+    /// A store is dirty when `write_count > clean_version`.
+    clean_version: u64,
 }
 
 impl ArenaNodeStore {
@@ -634,7 +641,24 @@ impl ArenaNodeStore {
             m,
             m_max0,
             blocks: Vec::new(),
+            write_count: 1, // new store is dirty — must be uploaded at least once
+            clean_version: 0,
         })
+    }
+
+    /// Returns the current write count. Capture this under the same read lock as the
+    /// snapshot, then pass to [`mark_all_clean_if_version`] after a successful upload.
+    pub fn write_count(&self) -> u64 {
+        self.write_count
+    }
+
+    /// Mark the store clean only if no writes have occurred since `version` was
+    /// captured. If `write_count` has advanced, a concurrent insert arrived during
+    /// the upload and the store must remain dirty for re-upload on the next cycle.
+    pub fn mark_all_clean_if_version(&mut self, version: u64) {
+        if self.write_count == version {
+            self.clean_version = version;
+        }
     }
 
     /// Set `len` on each block by counting how many `node_ids` map to it.
@@ -793,6 +817,17 @@ impl ArenaNodeStore {
         !self.blocks.is_empty() && self.blocks.iter().all(|b| b.is_evicted())
     }
 
+    /// Returns `true` if the store has been written to since the last successful
+    /// snapshot upload (`write_count > clean_version`).
+    pub fn has_dirty_blocks(&self) -> bool {
+        self.write_count > self.clean_version
+    }
+
+    /// Mark the store as clean unconditionally. Prefer [`mark_all_clean_if_version`].
+    pub fn mark_all_clean(&mut self) {
+        self.clean_version = self.write_count;
+    }
+
     #[inline]
     fn block(&self, block_index: usize) -> &NodeBlock {
         &self.blocks[block_index]
@@ -877,6 +912,23 @@ pub trait HnswNodeStore {
     /// Recompute block node-counts from a list of NodeIds. Called after
     /// [`load_from_dir`] + level loading during recovery. Default: no-op.
     fn rebuild_lens_from_node_ids(&mut self, _node_ids: &[NodeId]) {}
+    /// Returns `true` if any block has been written to since the last successful
+    /// snapshot upload. Default: `false`.
+    fn has_dirty_blocks(&self) -> bool {
+        false
+    }
+    /// Returns the monotonic write count at the moment the snapshot was taken.
+    /// Capture under the same read lock as the snapshot, pass to
+    /// [`mark_clean_if_version`] after a successful upload. Default: `0`.
+    fn write_count(&self) -> u64 {
+        0
+    }
+    /// Mark all blocks as clean after a successful snapshot upload. Default: no-op.
+    fn mark_all_clean(&mut self) {}
+    /// Mark all blocks clean only if no writes have occurred since `version` was
+    /// captured. Prevents the race where a new insert re-dirties the store between
+    /// the snapshot and the upload completion. Default: no-op.
+    fn mark_clean_if_version(&mut self, _version: u64) {}
     /// Copy in-memory storage units to `dir` without changing storage state. Default:
     /// no-op (returns `Ok(0)`). [`ArenaNodeStore`] overrides this to fan out across its
     /// blocks. Output format matches [`Self::swap_out`] so files are S3-restorable.
@@ -1006,15 +1058,14 @@ impl HnswNodeStore for ArenaNodeStore {
         loop {
             if let Some(block) = self.blocks.last_mut() {
                 if let Some(node_id) = block.push_node(vector, max_level) {
+                    self.write_count += 1;
                     return Some(node_id);
                 }
 
                 if is_new_block {
-                    // already tried to allocate a new block. Return None to indicate that the store is at capacity
                     return None;
                 }
 
-                // failed to push the node to the last block. Try to allocate a new block
                 let new_block =
                     NodeBlock::try_new(self.dim, self.m, self.m_max0, self.blocks.len()).unwrap();
                 self.blocks.push(new_block);
@@ -1160,6 +1211,22 @@ impl HnswNodeStore for ArenaNodeStore {
 
     fn rebuild_lens_from_node_ids(&mut self, node_ids: &[NodeId]) {
         ArenaNodeStore::rebuild_lens_from_node_ids(self, node_ids);
+    }
+
+    fn has_dirty_blocks(&self) -> bool {
+        ArenaNodeStore::has_dirty_blocks(self)
+    }
+
+    fn write_count(&self) -> u64 {
+        ArenaNodeStore::write_count(self)
+    }
+
+    fn mark_all_clean(&mut self) {
+        ArenaNodeStore::mark_all_clean(self);
+    }
+
+    fn mark_clean_if_version(&mut self, version: u64) {
+        ArenaNodeStore::mark_all_clean_if_version(self, version);
     }
 
     fn snapshot_to_dir(&self, dir: &Path) -> io::Result<usize> {

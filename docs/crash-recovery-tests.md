@@ -135,6 +135,34 @@ Result: `seq_0 = {10, 11}`, `seq_1 = {21}`.
 
 ---
 
+## Dirty-block tracking
+
+### `dirty_bucket_uploaded_clean_bucket_skipped`
+
+Integration test for dirty-block tracking against a real (in-memory) blob store.
+
+1. Insert two vectors → bucket dirty → snapshot cycle uploads → bucket clean.
+2. Multiple further snapshot cycles run with no new inserts → `snap_dir` in `bucket_meta.json` is **unchanged** (clean bucket skipped, no redundant upload).
+3. Insert a third vector → bucket dirty again → next snapshot cycle uploads a new `snap_T` → `snap_dir` advances.
+
+### `dirty_flag_race_condition_stale_version_leaves_bucket_dirty_for_reupload`
+
+Integration test for the write-count race condition fix, with full crash recovery.
+
+The race: a new vector arrives between the snapshot being taken and `mark_clean_if_version` being called. If the version is stale the dirty flag must not be cleared.
+
+1. Insert vid=1 → bucket dirty.
+2. Capture `write_count_before` (simulates snapshot task reading the version under read lock).
+3. Insert vid=2 (simulates a concurrent write during the upload — no lock held).
+4. Call `mark_bucket_clean_if_version(version=before)` with the stale version → asserts bucket **stays dirty**.
+5. Snapshot cycle runs → sees dirty bucket → re-uploads with both vid=1 and vid=2 → bucket marked clean (version now matches).
+6. Further cycles with no inserts → `snap_dir` unchanged (clean).
+7. Crash + recovery → both vid=1 and vid=2 are found.
+
+Without the fix (`mark_all_clean` instead of version-aware), step 4 would clear dirty, step 5 would skip the bucket, and step 7 would fail to find vid=2.
+
+---
+
 ## Key invariants tested
 
 | Property | Test(s) |
@@ -148,3 +176,5 @@ Result: `seq_0 = {10, 11}`, `seq_1 = {21}`.
 | WAL replays correctly across multiple buckets | `wal_replay_restores_vectors_to_all_buckets_after_partial_snapshot_crash` |
 | Partial cycle: already-snapshotted vectors deduped | `partial_snapshot_cycle_crash_deduplicates_already_snapshotted_bucket` |
 | WAL spanning two buckets replays each to correct bucket | `wal_spanning_both_buckets_after_partial_snapshot` |
+| Dirty bucket uploaded, clean bucket skipped | `dirty_bucket_uploaded_clean_bucket_skipped` |
+| Stale write-count prevents premature mark-clean | `dirty_flag_race_condition_stale_version_leaves_bucket_dirty_for_reupload` |

@@ -135,6 +135,44 @@ impl MemWeaverService {
         Some(n)
     }
 
+    /// Returns whether the specified bucket has dirty arena blocks. Test helper.
+    pub async fn is_bucket_dirty_test(&self, collection: &str, bucket_seq: u32) -> bool {
+        match self.collections.read().await.get(collection).cloned() {
+            None => false,
+            Some(col) => col.read().await.is_bucket_dirty(BucketSeq(bucket_seq)),
+        }
+    }
+
+    /// Returns the current write count for the specified bucket. Intended for testing
+    /// the dirty-flag race condition fix: capture this value before a simulated
+    /// concurrent insert, then pass it to [`mark_bucket_clean_if_version`].
+    pub async fn bucket_write_count(&self, collection: &str, bucket_seq: u32) -> u64 {
+        match self.collections.read().await.get(collection).cloned() {
+            None => 0,
+            Some(col) => col.read().await.bucket_write_count(BucketSeq(bucket_seq)),
+        }
+    }
+
+    /// Call `mark_bucket_clean_if_version` on the specified bucket. Used in tests to
+    /// simulate the snapshot task's mark-clean step with a captured version number,
+    /// exercising the race condition fix without actually running the full task.
+    pub async fn mark_bucket_clean_if_version(
+        &self,
+        collection: &str,
+        bucket_seq: u32,
+        version: u64,
+    ) -> bool {
+        match self.collections.read().await.get(collection).cloned() {
+            None => false,
+            Some(col) => {
+                col.write()
+                    .await
+                    .mark_bucket_clean_if_version(BucketSeq(bucket_seq), version);
+                true
+            }
+        }
+    }
+
     /// Permanently drop the oldest bucket from `name`'s index (delegates to
     /// [`TimeBucketIndex::evict_oldest`]). Returns `false` if the collection does
     /// not exist or has no buckets. Intended for TTL-style bucket management and tests.
@@ -260,10 +298,29 @@ impl MemWeaverService {
                         let snap_dir = data_dir.join(&col_name).join(format!("snap_{}", seq.0));
                         let bucket_prefix = col_prefix.child(format!("seq_{}", seq.0));
 
-                        // Write arena files + levels + manifest to a temp local dir.
-                        let snapped = {
+                        // Skip buckets with no dirty blocks — their previous snapshot
+                        // is still valid so no upload is needed.
+                        let is_dirty = col.read().await.is_bucket_dirty(seq);
+                        if !is_dirty {
+                            committed.insert(seq.0);
+                            // Still clean up any orphaned staging dirs for this bucket
+                            // (e.g. from a crash mid-upload in a previous cycle).
+                            if let Ok(meta) =
+                                download_bucket_meta(store.as_ref(), &bucket_prefix).await
+                            {
+                                cleanup_old_snaps(store.as_ref(), &bucket_prefix, &meta.snap_dir)
+                                    .await;
+                            }
+                            continue;
+                        }
+
+                        // Capture write_count and snapshot atomically under the same
+                        // read lock. Used after upload to avoid clearing dirty on blocks
+                        // written between the snapshot and the upload completion.
+                        let (snapped, write_count) = {
                             let idx = col.read().await;
-                            idx.snapshot_bucket(seq, &snap_dir)
+                            let wc = idx.bucket_write_count(seq);
+                            (idx.snapshot_bucket(seq, &snap_dir), wc)
                         };
 
                         match snapped {
@@ -287,7 +344,13 @@ impl MemWeaverService {
                         // complete snapshot is never partially overwritten.
                         // Layout: seq_<N>/snap_<T>/{block_*.arena, levels.bin, manifest.json}
                         // Commit: seq_<N>/bucket_meta.json points to snap_<T>.
-                        let snap_subdir = format!("snap_{now_secs}");
+                        let snap_subdir = format!(
+                            "snap_{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis()
+                        );
                         let staged_prefix = bucket_prefix.child(snap_subdir.as_str());
 
                         let bucket_meta = BucketMeta {
@@ -319,21 +382,14 @@ impl MemWeaverService {
                         match upload.await {
                             Ok(()) => {
                                 committed.insert(seq.0);
-                                // Clean up any old snap_* dirs in this bucket prefix that
-                                // are no longer the active snapshot.
-                                if let Ok(listing) =
-                                    store.list_with_delimiter(Some(&bucket_prefix)).await
-                                {
-                                    for old in listing.common_prefixes {
-                                        let name =
-                                            old.parts().last().map(|p| p.as_ref().to_owned());
-                                        if let Some(name) = name {
-                                            if name != snap_subdir && name.starts_with("snap_") {
-                                                let _ = delete_prefix(store.as_ref(), &old).await;
-                                            }
-                                        }
-                                    }
-                                }
+                                // Only mark clean if no writes arrived after the snapshot
+                                // was taken (write_count captured under the same read lock).
+                                col.write()
+                                    .await
+                                    .mark_bucket_clean_if_version(seq, write_count);
+                                // Clean up stale snap_* dirs for this bucket.
+                                cleanup_old_snaps(store.as_ref(), &bucket_prefix, &snap_subdir)
+                                    .await;
                             }
                             Err(e) => eprintln!(
                                 "snapshot: {col_name}/seq_{}: blob upload failed: {e}",
@@ -423,7 +479,7 @@ impl MemWeaverService {
     /// Spawn a background task that uploads pending WAL entries to blob storage and
     /// signals waiting `batch_insert` callers once their entry is confirmed uploaded.
     ///
-    /// The task scans `<data_dir>/<collection>/wal/*.json` for each collection on every
+    /// Spawn a background task that uploads pending WAL entries to blob storage and
     /// tick, uploads any file not yet in blob storage, then calls `mark_uploaded` so
     /// `batch_insert` can return. Local WAL files are removed after a successful upload.
     ///
@@ -736,6 +792,23 @@ impl MemWeaverService {
     }
 }
 
+/// Delete all `snap_*/` subdirectories under `bucket_prefix` in `store` except for
+/// `active_snap`. Called after a successful upload (dirty bucket) and after confirming
+/// a clean bucket's current pointer, so orphaned staging dirs from crashed cycles are
+/// always cleaned up regardless of whether a new upload happened this cycle.
+async fn cleanup_old_snaps(store: &dyn ObjectStore, bucket_prefix: &ObjectPath, active_snap: &str) {
+    if let Ok(listing) = store.list_with_delimiter(Some(bucket_prefix)).await {
+        for old in listing.common_prefixes {
+            let name = old.parts().last().map(|p| p.as_ref().to_owned());
+            if let Some(name) = name {
+                if name != active_snap && name.starts_with("snap_") {
+                    let _ = delete_prefix(store, &old).await;
+                }
+            }
+        }
+    }
+}
+
 fn invalid(msg: impl Into<String>) -> Status {
     Status::invalid_argument(msg.into())
 }
@@ -1014,11 +1087,13 @@ impl MemWeaver for MemWeaverService {
         let seq = BucketSeq(r.bucket_seq);
 
         // Swap to disk first (holds write lock only during disk I/O).
-        let (found, created_at_secs) = {
+        // Capture write_count so we can use the version-aware mark_clean after upload.
+        let (found, created_at_secs, write_count) = {
             let mut idx = col.write().await;
             let created_at = idx.bucket_created_at(seq).map(|t| t.0).unwrap_or(0);
+            let wc = idx.bucket_write_count(seq);
             let found = idx.swap_bucket_out(seq, &local_dir).map_err(internal)?;
-            (found, created_at)
+            (found, created_at, wc)
         };
 
         // Upload to blob storage without any lock — files are stable on disk.
@@ -1030,7 +1105,7 @@ impl MemWeaver for MemWeaverService {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .as_secs()
+                    .as_millis()
             );
             let staged = prefix.child(snap_subdir.as_str());
             upload_arena_dir(store.as_ref(), &local_dir, &staged)
@@ -1054,6 +1129,12 @@ impl MemWeaver for MemWeaverService {
             )
             .await
             .map_err(internal)?;
+
+            // Clear dirty flags only if no new inserts arrived since we captured
+            // write_count — same race-free semantics as the snapshot task.
+            col.write()
+                .await
+                .mark_bucket_clean_if_version(seq, write_count);
         }
         Ok(Response::new(SwapBucketOutToBlobResponse { found }))
     }

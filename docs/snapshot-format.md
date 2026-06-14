@@ -180,6 +180,15 @@ HNSW index entry point and depth, required to resume search after recovery.
 | `max_layer` | Highest allocated HNSW layer |
 | `arena_files` | Arena file names in this bucket's prefix |
 
+## Written by
+
+Two paths produce snapshots in this format:
+
+- **Snapshot task** (`SNAPSHOT_INTERVAL_SECS`) — periodic background task that copies every in-memory bucket to blob storage without changing memory state.
+- **`SwapBucketOutToBlob` RPC** — explicit operator-driven eviction that writes the bucket to local disk first, then uploads using the same versioned `snap_T/` + `bucket_meta.json` layout. Files written by this RPC are interchangeable with snapshot-task output and are visible to crash recovery.
+
+`SwapBucketInFromBlob` is the inverse: it reads `bucket_meta.json` to locate the versioned `snap_T/` directory and downloads from there.
+
 ## Recovery procedure
 
 1. Download `catalog.json` to get the list of live collections and their configurations. If the catalog is absent, fall back to listing all `<collection>/` prefixes and reading each `collection.json`.

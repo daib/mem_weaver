@@ -56,6 +56,9 @@ pub trait HnswIndex {
     fn load_manifest(&mut self, path: &std::path::Path) -> std::io::Result<()>;
     /// Drop the in-memory `node_ids` and `levels` buffers after they have been persisted.
     fn clear_level_data(&mut self);
+    /// Return the application-level vector IDs of every node in this index.
+    /// Populated after [`load_levels`]; empty after [`clear_level_data`].
+    fn vector_ids(&self) -> &[u64];
 }
 
 /// HNSW index: `N` holds the graph ([`NaiveNodeStore`] or [`ArenaNodeStore`](super::nodes::ArenaNodeStore)), `S` holds vectors.
@@ -191,6 +194,10 @@ impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
 
     fn clear_level_data(&mut self) {
         Hnsw::clear_level_data(self)
+    }
+
+    fn vector_ids(&self) -> &[u64] {
+        &self.vector_ids
     }
 }
 

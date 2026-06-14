@@ -98,6 +98,9 @@ pub struct TimeBucketIndex {
     buckets: VecDeque<Bucket>,
     next_seq: BucketSeq,
     rng: StdRng,
+    /// Set of all vector IDs currently stored across all buckets. Used to deduplicate
+    /// inserts — `insert` is a no-op for IDs already present, returning `None`.
+    known_vector_ids: std::collections::HashSet<u64>,
 }
 
 impl TimeBucketIndex {
@@ -152,6 +155,7 @@ impl TimeBucketIndex {
             buckets: VecDeque::new(),
             next_seq: BucketSeq(0),
             rng,
+            known_vector_ids: std::collections::HashSet::new(),
         })
     }
 
@@ -175,6 +179,15 @@ impl TimeBucketIndex {
     /// Returns `(seq, created_at)` for every active bucket, newest first.
     pub fn bucket_metas(&self) -> Vec<(BucketSeq, Timestamp)> {
         self.buckets.iter().map(|b| (b.seq, b.created_at)).collect()
+    }
+
+    /// Returns the grid-aligned creation timestamp of the bucket with `seq`, or
+    /// `None` if no such bucket exists.
+    pub fn bucket_created_at(&self, seq: BucketSeq) -> Option<Timestamp> {
+        self.buckets
+            .iter()
+            .find(|b| b.seq == seq)
+            .map(|b| b.created_at)
     }
 
     /// Returns `true` if a bucket with `seq` is tracked by this index.
@@ -219,15 +232,20 @@ impl TimeBucketIndex {
 
     /// Insert `vector` into the bucket whose window covers `timestamp`.
     ///
-    /// The target window start is `bucket_start(timestamp)`. If it is ahead of
-    /// the current newest bucket a new bucket is created at that grid position.
-    /// `timestamp` drives the grid-aligned `created_at` of any new bucket.
+    /// Returns `Some(BucketedNodeId)` on success, or `None` if `vector_id` is already
+    /// present in this index (duplicate skipped). This makes inserts idempotent: a
+    /// retry or WAL replay for a vector that was already captured in a snapshot will
+    /// silently no-op rather than creating a second node with the same application ID.
     pub fn insert(
         &mut self,
         vector: &[f32],
         timestamp: Timestamp,
         vector_id: u64,
-    ) -> BucketedNodeId {
+    ) -> Option<BucketedNodeId> {
+        if !self.known_vector_ids.insert(vector_id) {
+            return None; // already present
+        }
+
         let start = self.bucket_start(timestamp);
         let needs_new = self.buckets.front().map_or(true, |b| start > b.created_at);
         if needs_new {
@@ -236,10 +254,10 @@ impl TimeBucketIndex {
 
         let bucket = self.buckets.front_mut().expect("just allocated");
         bucket.index.insert(vector, vector_id);
-        BucketedNodeId {
+        Some(BucketedNodeId {
             bucket_seq: bucket.seq,
             vector_id,
-        }
+        })
     }
 
     /// Force-start a new bucket at the grid slot for `timestamp`.
@@ -456,6 +474,12 @@ impl TimeBucketIndex {
         index.load_levels(&local_dir.join("levels.bin"))?;
         index.rebuild_lens(); // fix block.len so len()/is_empty() are correct
         index.load_manifest(&local_dir.join("manifest.json"))?;
+
+        // Register all restored vector IDs in the dedup set so that WAL replay
+        // and future inserts won't create duplicate nodes for already-present vectors.
+        self.known_vector_ids
+            .extend(index.vector_ids().iter().copied());
+
         // push_front so that the last call (newest bucket) ends up at the front.
         self.buckets.push_front(Bucket {
             seq,
@@ -649,7 +673,7 @@ mod tests {
     fn single_insert_and_exact_recall() {
         let mut idx = make_index(10);
         let v = [1.0f32, 0.0, 0.0, 0.0];
-        let bid = idx.insert(&v, ts(0), 0u64);
+        let bid = idx.insert(&v, ts(0), 0u64).unwrap();
         assert_eq!(idx.len(), 1);
         assert_eq!(idx.bucket_count(), 1);
 
@@ -741,9 +765,9 @@ mod tests {
         // Older bucket holds the geometrically nearest point; newer holds a farther one.
         // A high penalty on the older bucket must make the newer result win.
         let mut idx = make_index(1);
-        let bid_near = idx.insert(&[0.1f32, 0.0, 0.0, 0.0], ts(0), 0u64);
+        let bid_near = idx.insert(&[0.1f32, 0.0, 0.0, 0.0], ts(0), 0u64).unwrap();
         idx.rotate_bucket(ts(1));
-        let bid_far = idx.insert(&[1.0f32, 0.0, 0.0, 0.0], ts(1), 1u64);
+        let bid_far = idx.insert(&[1.0f32, 0.0, 0.0, 0.0], ts(1), 1u64).unwrap();
 
         let query = [0.0f32; 4];
 
@@ -801,11 +825,11 @@ mod tests {
     fn time_range_restricts_to_matching_buckets() {
         // Three buckets: t=0 (duration=10 → window [0,10)), t=10 ([10,20)), t=20 ([20,30)).
         let mut idx = make_index(10);
-        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64); // bucket [0,10)
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64).unwrap(); // bucket [0,10)
         idx.insert(&[9.0, 0.0, 0.0, 0.0], ts(5), 1u64); // also bucket [0,10)
-        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10), 2u64); // bucket [10,20)
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10), 2u64).unwrap(); // bucket [10,20)
         idx.insert(&[9.0, 0.0, 0.0, 0.0], ts(15), 3u64); // also bucket [10,20)
-        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20), 4u64); // bucket [20,30)
+        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20), 4u64).unwrap(); // bucket [20,30)
         assert_eq!(idx.bucket_count(), 3);
 
         let query = [0.0f32; 4];
@@ -957,9 +981,9 @@ mod tests {
         let root = unique_swap_dir("mixed_range");
         let _guard = DirGuard(root.clone());
         let mut idx = make_index(10);
-        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64);
-        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10), 1u64);
-        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20), 2u64);
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64).unwrap();
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(10), 1u64).unwrap();
+        let bid2 = idx.insert(&[3.0, 0.0, 0.0, 0.0], ts(20), 2u64).unwrap();
 
         idx.swap_bucket_out(bid1.bucket_seq, &root.join("seq_1"))
             .expect("swap_out");
@@ -1224,8 +1248,8 @@ mod tests {
         let root = unique_swap_dir("snap_state");
         let _guard = DirGuard(root.clone());
         let mut idx = make_index(10);
-        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64);
-        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 1u64);
+        let bid0 = idx.insert(&[1.0, 0.0, 0.0, 0.0], ts(0), 0u64).unwrap();
+        let bid1 = idx.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 1u64).unwrap();
         let seq = BucketSeq(0);
 
         let before = idx.search(&[0.0; 4], 2, 16, |_, d| d, None, top_k_quickselect);
@@ -1395,8 +1419,8 @@ mod tests {
 
         // Build an original index with two buckets.
         let mut src = make_index(10);
-        let bid0 = src.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 10u64);
-        let bid1 = src.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 11u64);
+        let bid0 = src.insert(&[0.1, 0.0, 0.0, 0.0], ts(0), 10u64).unwrap();
+        let bid1 = src.insert(&[2.0, 0.0, 0.0, 0.0], ts(0), 11u64).unwrap();
 
         let query = [0.5, 0.0, 0.0, 0.0];
         let before = src.search(&query, 2, 16, |_, d| d, None, top_k_quickselect);

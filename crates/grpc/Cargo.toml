@@ -17,6 +17,8 @@ tokio = { workspace = true }
 rand = "0.8"
 memmap2 = { workspace = true }
 object_store = { workspace = true, features = ["aws"] }
+bytes = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tokio-stream = { version = "0.1", features = ["net"] }

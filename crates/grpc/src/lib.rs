@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use common::{top_k_quickselect, Timestamp};
 use index::{
-    delete_prefix, BucketMeta, BucketSeq, Catalog, CatalogEntry, CollectionMeta, TimeBucketIndex,
+    decode_wal_entry, delete_prefix, delete_wal_entries_up_to, download_wal_entry,
+    encode_wal_entry, list_wal_seqs, upload_wal_bytes, BucketMeta, BucketSeq, Catalog,
+    CatalogEntry, CollectionMeta, TimeBucketIndex, WalEntry, WalItem,
 };
 use index::{
     download_arena_dir, download_bucket_meta, download_catalog, download_collection_meta,
@@ -21,6 +24,50 @@ use object_store::{path::Path as ObjectPath, ObjectStore};
 use rand::{rngs::StdRng, SeedableRng};
 use tokio::sync::RwLock;
 use tonic::{Request, Response, Status};
+
+/// Per-collection WAL state. Tracks the monotonic sequence counter and provides
+/// a watch channel so `batch_insert` can block until its entry is uploaded to S3.
+struct WalState {
+    next_seq: AtomicU64,
+    /// Sender updated by the WAL uploader each time a seq is confirmed uploaded.
+    uploaded_tx: tokio::sync::watch::Sender<u64>,
+    uploaded_rx: tokio::sync::watch::Receiver<u64>,
+}
+
+impl WalState {
+    fn new(start_seq: u64) -> Arc<Self> {
+        let (tx, rx) = tokio::sync::watch::channel(start_seq.saturating_sub(1));
+        Arc::new(Self {
+            next_seq: AtomicU64::new(start_seq),
+            uploaded_tx: tx,
+            uploaded_rx: rx,
+        })
+    }
+
+    fn alloc_seq(&self) -> u64 {
+        self.next_seq.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn current_seq(&self) -> u64 {
+        self.next_seq.load(Ordering::Relaxed).saturating_sub(1)
+    }
+
+    fn mark_uploaded(&self, seq: u64) {
+        let _ = self.uploaded_tx.send(seq);
+    }
+
+    async fn wait_for_upload(&self, seq: u64) {
+        let mut rx = self.uploaded_rx.clone();
+        loop {
+            if *rx.borrow() >= seq {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return; // sender dropped (service shutting down)
+            }
+        }
+    }
+}
 
 /// Configuration for the periodic arena snapshot task.
 pub struct SnapshotConfig {
@@ -47,6 +94,8 @@ type Collection = Arc<RwLock<TimeBucketIndex>>;
 
 pub struct MemWeaverService {
     collections: Arc<RwLock<HashMap<String, Collection>>>,
+    /// Per-collection WAL state (seq counter + upload notification channel).
+    wal_states: Arc<std::sync::Mutex<HashMap<String, Arc<WalState>>>>,
     /// Base directory for on-disk bucket files. Bucket `seq` of collection `c` is stored
     /// under `<data_dir>/<c>/seq_<seq>/`.
     data_dir: PathBuf,
@@ -61,6 +110,7 @@ impl MemWeaverService {
     pub fn new() -> Self {
         Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
+            wal_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             data_dir: PathBuf::from("./data"),
             store: None,
             blob_prefix: ObjectPath::from("mem-weaver"),
@@ -104,10 +154,26 @@ impl MemWeaverService {
     ) -> Self {
         Self {
             collections: Arc::new(RwLock::new(HashMap::new())),
+            wal_states: Arc::new(std::sync::Mutex::new(HashMap::new())),
             data_dir: data_dir.into(),
             store,
             blob_prefix: ObjectPath::from(blob_prefix.into()),
         }
+    }
+
+    fn wal_local_dir(&self, collection: &str) -> PathBuf {
+        self.data_dir.join(collection).join("wal")
+    }
+
+    fn wal_blob_prefix(&self, collection: &str) -> ObjectPath {
+        self.blob_prefix.child(collection)
+    }
+
+    fn get_or_create_wal(&self, collection: &str, start_seq: u64) -> Arc<WalState> {
+        let mut map = self.wal_states.lock().expect("wal_states lock");
+        map.entry(collection.to_owned())
+            .or_insert_with(|| WalState::new(start_seq))
+            .clone()
     }
 
     fn bucket_local_dir(&self, collection: &str, seq: u32) -> PathBuf {
@@ -144,6 +210,7 @@ impl MemWeaverService {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let store = self.store.clone()?;
         let collections = Arc::clone(&self.collections);
+        let wal_states = Arc::clone(&self.wal_states);
         let data_dir = self.data_dir.clone();
         let blob_prefix = self.blob_prefix.clone();
 
@@ -173,25 +240,17 @@ impl MemWeaverService {
                         (idx.config(), idx.bucket_metas())
                     };
 
-                    // Upload collection.json so recovery knows the index parameters.
                     let (dim, m, m_max0, ef_construction, bucket_duration) = col_config;
-                    let col_meta = CollectionMeta {
-                        version: 1,
-                        dim,
-                        m,
-                        m_max0,
-                        ef_construction,
-                        bucket_duration_secs: bucket_duration.as_secs(),
-                        snapshot_at_secs: now_secs,
+                    // Snapshot the WAL high-water mark now. collection.json is only
+                    // written after ALL buckets succeed, so this value is never
+                    // committed unless the full cycle completes.
+                    let wal_high_seq = {
+                        let map = wal_states.lock().expect("wal_states lock");
+                        map.get(&col_name).map_or(0, |w| w.current_seq())
                     };
-                    if let Err(e) =
-                        upload_collection_meta(store.as_ref(), &col_meta, &col_prefix).await
-                    {
-                        eprintln!("snapshot: {col_name}: collection.json upload failed: {e}");
-                    }
 
                     // Track seqs that were successfully committed this cycle so we
-                    // can delete S3 prefixes for buckets that are no longer live.
+                    // can decide whether to advance wal_high_seq and delete stale prefixes.
                     let mut committed: std::collections::HashSet<u32> =
                         std::collections::HashSet::new();
 
@@ -292,6 +351,38 @@ impl MemWeaverService {
                     let live_seqs: std::collections::HashSet<u32> =
                         bucket_metas.iter().map(|(s, _)| s.0).collect();
                     if committed == live_seqs {
+                        // Every live bucket was successfully snapshotted this cycle.
+                        // Only now is it safe to advance wal_high_seq: all buckets
+                        // have data up to this point, so recovery can safely skip
+                        // WAL entries up to wal_high_seq without losing vectors from
+                        // any bucket.
+                        let col_meta = CollectionMeta {
+                            version: 1,
+                            dim,
+                            m,
+                            m_max0,
+                            ef_construction,
+                            bucket_duration_secs: bucket_duration.as_secs(),
+                            snapshot_at_secs: now_secs,
+                            wal_high_seq,
+                        };
+                        match upload_collection_meta(store.as_ref(), &col_meta, &col_prefix).await {
+                            Err(e) => eprintln!(
+                                "snapshot: {col_name}: collection.json upload failed: {e}"
+                            ),
+                            Ok(()) => {
+                                if let Err(e) = delete_wal_entries_up_to(
+                                    store.as_ref(),
+                                    &col_prefix,
+                                    wal_high_seq,
+                                )
+                                .await
+                                {
+                                    eprintln!("snapshot: {col_name}: WAL prune failed: {e}");
+                                }
+                            }
+                        }
+
                         // List all seq_*/ prefixes in blob storage for this collection.
                         let listed = store.list_with_delimiter(Some(&col_prefix)).await;
                         match listed {
@@ -323,6 +414,98 @@ impl MemWeaverService {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }))
+    }
+
+    /// Spawn a background task that uploads pending WAL entries to blob storage and
+    /// signals waiting `batch_insert` callers once their entry is confirmed uploaded.
+    ///
+    /// The task scans `<data_dir>/<collection>/wal/*.json` for each collection on every
+    /// tick, uploads any file not yet in blob storage, then calls `mark_uploaded` so
+    /// `batch_insert` can return. Local WAL files are removed after a successful upload.
+    ///
+    /// Returns `None` if no object store is configured.
+    pub fn spawn_wal_upload_task(&self, interval: Duration) -> Option<tokio::task::JoinHandle<()>> {
+        let store = self.store.clone()?;
+        let wal_states = Arc::clone(&self.wal_states);
+        let data_dir = self.data_dir.clone();
+        let blob_prefix = self.blob_prefix.clone();
+
+        Some(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+
+                // Collect (collection_name, wal_dir) pairs for all live collections.
+                let entries: Vec<(String, PathBuf, ObjectPath)> = {
+                    let map = wal_states.lock().expect("wal_states lock");
+                    map.keys()
+                        .map(|name| {
+                            let wal_dir = data_dir.join(name).join("wal");
+                            let prefix = blob_prefix.child(name.as_str());
+                            (name.clone(), wal_dir, prefix)
+                        })
+                        .collect()
+                };
+
+                for (col_name, wal_dir, col_prefix) in entries {
+                    // List local WAL files sorted ascending.
+                    let local_files: Vec<(u64, PathBuf)> = match std::fs::read_dir(&wal_dir) {
+                        Err(_) => continue, // no WAL dir yet
+                        Ok(dir) => {
+                            let mut v: Vec<(u64, PathBuf)> = dir
+                                .filter_map(|e| {
+                                    let p = e.ok()?.path();
+                                    if p.extension().and_then(|s| s.to_str()) != Some("wal") {
+                                        return None;
+                                    }
+                                    let seq = p
+                                        .file_stem()
+                                        .and_then(|s| s.to_str())
+                                        .and_then(|s| s.parse::<u64>().ok())?;
+                                    Some((seq, p))
+                                })
+                                .collect();
+                            v.sort_by_key(|(seq, _)| *seq);
+                            v
+                        }
+                    };
+
+                    let wal = {
+                        let map = wal_states.lock().expect("wal_states lock");
+                        map.get(&col_name).cloned()
+                    };
+                    let Some(wal) = wal else { continue };
+
+                    for (seq, path) in local_files {
+                        // Read raw bytes — validate CRC32 before uploading.
+                        let bytes = match std::fs::read(&path) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                eprintln!("wal: {col_name}/seq_{seq}: read failed: {e}");
+                                continue;
+                            }
+                        };
+                        if decode_wal_entry(&bytes).is_err() {
+                            eprintln!("wal: {col_name}/seq_{seq}: corrupt entry, skipping");
+                            let _ = std::fs::remove_file(&path);
+                            continue;
+                        }
+
+                        // Upload raw bytes directly — no re-serialisation needed.
+                        let blob_bytes = bytes::Bytes::from(bytes);
+                        if let Err(e) =
+                            upload_wal_bytes(store.as_ref(), seq, blob_bytes, &col_prefix).await
+                        {
+                            eprintln!("wal: {col_name}/seq_{seq}: upload failed: {e}");
+                            continue;
+                        }
+
+                        // Remove local file and signal waiting inserts.
+                        let _ = std::fs::remove_file(&path);
+                        wal.mark_uploaded(seq);
                     }
                 }
             }
@@ -385,6 +568,7 @@ impl MemWeaverService {
                                 ef_construction: m.ef_construction,
                                 bucket_duration_secs: m.bucket_duration_secs,
                                 snapshot_at_secs: m.snapshot_at_secs,
+                                wal_high_seq: m.wal_high_seq,
                             }),
                             Err(e) => eprintln!("recovery: {col_name}: collection.json error: {e}"),
                         }
@@ -501,6 +685,47 @@ impl MemWeaverService {
                 "recovery: {col_name}: {} bucket(s) restored",
                 index.bucket_count()
             );
+
+            // Replay WAL entries that arrived after the snapshot was taken.
+            // Duplicate detection is handled by TimeBucketIndex::insert, which tracks
+            // known_vector_ids internally — no dedup logic needed here.
+            let wal_high_seq = entry.wal_high_seq;
+            let col_prefix = self.blob_prefix.child(col_name.as_str());
+            let wal_seqs = list_wal_seqs(store.as_ref(), &col_prefix)
+                .await
+                .unwrap_or_default();
+            let mut max_replayed_seq = wal_high_seq;
+            for seq in wal_seqs.into_iter().filter(|&s| s > wal_high_seq) {
+                match download_wal_entry(store.as_ref(), &col_prefix, seq).await {
+                    Ok(wal_entry) => {
+                        let mut inserted = 0usize;
+                        let mut skipped = 0usize;
+                        for item in &wal_entry.items {
+                            match index.insert(
+                                &item.vector,
+                                Timestamp(item.timestamp),
+                                item.vector_id,
+                            ) {
+                                Some(_) => inserted += 1,
+                                None => skipped += 1,
+                            }
+                        }
+                        max_replayed_seq = max_replayed_seq.max(seq);
+                        eprintln!(
+                            "recovery: {col_name}: replayed WAL seq {seq} \
+                             ({inserted} inserted, {skipped} duplicate(s) skipped)"
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("recovery: {col_name}: WAL seq {seq} download failed: {e}");
+                    }
+                }
+            }
+
+            // Initialise WalState so new inserts continue from where WAL left off.
+            let start_seq = max_replayed_seq + 1;
+            self.get_or_create_wal(&col_name, start_seq);
+
             self.collections
                 .write()
                 .await
@@ -577,6 +802,9 @@ impl MemWeaver for MemWeaverService {
             cols.insert(r.collection.clone(), Arc::new(RwLock::new(index)));
         }
 
+        // Create WAL state for this collection starting at seq 1.
+        self.get_or_create_wal(&r.collection, 1);
+
         // Best-effort: write the updated catalog to blob storage so recovery knows this
         // collection exists (with its full config). Done after releasing the write
         // lock to avoid holding it across async I/O. Failure is logged, not fatal.
@@ -591,6 +819,10 @@ impl MemWeaver for MemWeaverService {
                 let mut v = Vec::with_capacity(cols.len());
                 for (name, col) in cols.iter() {
                     let (dim, m, m_max0, ef_construction, bd) = col.read().await.config();
+                    let wal_high = {
+                        let map = self.wal_states.lock().expect("wal_states");
+                        map.get(name).map_or(0, |w| w.current_seq())
+                    };
                     v.push(CatalogEntry {
                         name: name.clone(),
                         dim,
@@ -599,6 +831,7 @@ impl MemWeaver for MemWeaverService {
                         ef_construction,
                         bucket_duration_secs: bd.as_secs(),
                         snapshot_at_secs: now_secs,
+                        wal_high_seq: wal_high,
                     });
                 }
                 v
@@ -631,18 +864,54 @@ impl MemWeaver for MemWeaverService {
             }
         }
         let col = get_collection(&self.collections, &r.collection).await?;
-        let mut idx = col.write().await;
-        let results = r
-            .items
-            .iter()
-            .map(|item| {
-                let bid = idx.insert(&item.vector, Timestamp(item.timestamp), item.vector_id);
-                InsertResult {
-                    bucket_seq: bid.bucket_seq.0,
-                    vector_id: bid.vector_id,
-                }
-            })
-            .collect();
+
+        // Alloc a WAL seq, apply to the in-memory index under the write lock, then
+        // release the lock before the (potentially slow) WAL write + blob upload.
+        let wal = self.get_or_create_wal(&r.collection, 1);
+        let seq = wal.alloc_seq();
+        let results: Vec<InsertResult> = {
+            let mut idx = col.write().await;
+            r.items
+                .iter()
+                .filter_map(|item| {
+                    idx.insert(&item.vector, Timestamp(item.timestamp), item.vector_id)
+                        .map(|bid| InsertResult {
+                            bucket_seq: bid.bucket_seq.0,
+                            vector_id: bid.vector_id,
+                        })
+                })
+                .collect()
+        };
+
+        // Write WAL entry to local disk so it survives a crash before S3 upload.
+        let wal_dir = self.wal_local_dir(&r.collection);
+        if let Err(e) = std::fs::create_dir_all(&wal_dir) {
+            return Err(internal(format!("WAL dir create failed: {e}")));
+        }
+        let wal_path = wal_dir.join(format!("{seq:020}.wal"));
+        let wal_entry = WalEntry {
+            seq,
+            items: r
+                .items
+                .iter()
+                .map(|item| WalItem {
+                    vector: item.vector.clone(),
+                    timestamp: item.timestamp,
+                    vector_id: item.vector_id,
+                })
+                .collect(),
+        };
+        let encoded = encode_wal_entry(&wal_entry);
+        std::fs::write(&wal_path, &encoded)
+            .map_err(|e| internal(format!("WAL disk write failed: {e}")))?;
+
+        // Wait until the background WAL uploader confirms this entry is in blob storage.
+        // If no store is configured the uploader never runs; skip the wait so inserts
+        // are acked immediately (same behaviour as before WAL was added).
+        if self.store.is_some() {
+            wal.wait_for_upload(seq).await;
+        }
+
         Ok(Response::new(BatchInsertResponse { results }))
     }
 
@@ -745,23 +1014,46 @@ impl MemWeaver for MemWeaverService {
         let seq = BucketSeq(r.bucket_seq);
 
         // Swap to disk first (holds write lock only during disk I/O).
-        let found = col
-            .write()
-            .await
-            .swap_bucket_out(seq, &local_dir)
-            .map_err(internal)?;
+        let (found, created_at_secs) = {
+            let mut idx = col.write().await;
+            let created_at = idx.bucket_created_at(seq).map(|t| t.0).unwrap_or(0);
+            let found = idx.swap_bucket_out(seq, &local_dir).map_err(internal)?;
+            (found, created_at)
+        };
 
         // Upload to blob storage without any lock — files are stable on disk.
+        // Uses the same versioned staging format as the snapshot task so that
+        // recovery can find the snapshot via bucket_meta.json.
         if found {
-            upload_arena_dir(store.as_ref(), &local_dir, &prefix)
+            let snap_subdir = format!(
+                "snap_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            );
+            let staged = prefix.child(snap_subdir.as_str());
+            upload_arena_dir(store.as_ref(), &local_dir, &staged)
                 .await
                 .map_err(internal)?;
-            upload_levels(store.as_ref(), &local_dir.join("levels.bin"), &prefix)
+            upload_levels(store.as_ref(), &local_dir.join("levels.bin"), &staged)
                 .await
                 .map_err(internal)?;
-            upload_manifest(store.as_ref(), &local_dir.join("manifest.json"), &prefix)
+            upload_manifest(store.as_ref(), &local_dir.join("manifest.json"), &staged)
                 .await
                 .map_err(internal)?;
+            upload_bucket_meta(
+                store.as_ref(),
+                &BucketMeta {
+                    version: 1,
+                    seq: r.bucket_seq,
+                    created_at_secs,
+                    snap_dir: snap_subdir,
+                },
+                &prefix,
+            )
+            .await
+            .map_err(internal)?;
         }
         Ok(Response::new(SwapBucketOutToBlobResponse { found }))
     }
@@ -791,15 +1083,22 @@ impl MemWeaver for MemWeaverService {
             }
         }
 
-        // Download from blob storage without any lock.
+        // Read bucket_meta.json to find the versioned snap_T/ subdirectory,
+        // then download from there — consistent with how the snapshot task and
+        // recovery code write and read blobs.
+        let bucket_meta = download_bucket_meta(store.as_ref(), &prefix)
+            .await
+            .map_err(internal)?;
+        let versioned = prefix.child(bucket_meta.snap_dir.as_str());
+
         std::fs::create_dir_all(&local_dir).map_err(internal)?;
-        download_arena_dir(store.as_ref(), &prefix, &local_dir)
+        download_arena_dir(store.as_ref(), &versioned, &local_dir)
             .await
             .map_err(internal)?;
-        download_levels(store.as_ref(), &prefix, &local_dir.join("levels.bin"))
+        download_levels(store.as_ref(), &versioned, &local_dir.join("levels.bin"))
             .await
             .map_err(internal)?;
-        download_manifest(store.as_ref(), &prefix, &local_dir.join("manifest.json"))
+        download_manifest(store.as_ref(), &versioned, &local_dir.join("manifest.json"))
             .await
             .map_err(internal)?;
 

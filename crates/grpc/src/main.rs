@@ -10,6 +10,9 @@
 //!   BLOB_PROFILE           AWS credentials profile (default: default)
 //!   BLOB_PREFIX            base key prefix (default: mem-weaver)
 //!
+//! WAL upload (requires blob storage):
+//!   WAL_UPLOAD_INTERVAL_MS upload pending WAL entries every N ms (default: 200)
+//!
 //! Periodic snapshots (requires blob storage to be configured):
 //!   SNAPSHOT_INTERVAL_SECS snapshot every N seconds; unset disables snapshots
 //!
@@ -49,11 +52,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    let wal_upload_interval = Duration::from_millis(
+        std::env::var("WAL_UPLOAD_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(200),
+    );
+
     let service = MemWeaverService::with_storage(data_dir.clone(), store, blob_prefix);
 
     eprintln!("mem-weaver-server: recovering from blob snapshots…");
     if let Err(e) = service.recover_from_snapshots().await {
         eprintln!("mem-weaver-server: recovery failed: {e}");
+    }
+
+    match service.spawn_wal_upload_task(wal_upload_interval) {
+        Some(_) => eprintln!(
+            "mem-weaver-server: WAL upload task started (interval={}ms)",
+            wal_upload_interval.as_millis()
+        ),
+        None => eprintln!("mem-weaver-server: blob storage not configured — WAL uploads disabled"),
     }
 
     if let Some(interval) = snapshot_interval {

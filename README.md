@@ -310,7 +310,7 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] Cold bucket search via temporary file read
 - [x] S3/GCS/Azure cold tier via `object_store`
 
-**Persistence and crash recovery:**
+**Persistence and crash recovery** ([format](docs/snapshot-format.md) · [recovery](docs/crash-recovery.md) · [tests](docs/crash-recovery-tests.md)):
 - [x] Metadata storage (levels.bin, manifest.json)
 - [x] Periodic arena snapshots to blob storage (versioned staging, CRC32)
 - [x] Write-Ahead Log — inserts acked only after WAL entry confirmed in blob storage

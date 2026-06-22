@@ -375,6 +375,7 @@ impl<N: HnswNodeStore> Hnsw<N> {
                 // create bidirectional edges between the new node and the selected candidates
                 self.update_neighbors(new_id, &selected, lc);
 
+                // select the best candidate of the current level as the new entry point for the next level
                 if let Some(&best) = selected.first() {
                     ep = best;
                 }

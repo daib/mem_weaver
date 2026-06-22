@@ -8,6 +8,7 @@ description = "Approximate nearest-neighbor indexes (HNSW)"
 common = { path = "../common", features = ["s3"] }
 vector = { path = "../vector" }
 rand = "0.8"
+rayon = "1"
 object_store = { workspace = true, features = ["aws"] }
 tokio = { workspace = true }
 bytes = { workspace = true }

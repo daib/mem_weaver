@@ -57,18 +57,20 @@ Each stage is an independent Temporal activity — crash-safe, retriable, observ
 
 ## Benchmarks
 
-Evaluated on AWS m5d.4xlarge (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) using the [SIFT1M](http://corpus-texmex.irisa.fr/) dataset (1M vectors, dim=128).
+Evaluated on SIFT1M (1M vectors, dim=128) using two hardware configurations:
+- **AWS m5d.4xlarge** (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) — arena vs naive comparison
+- **Apple M-series, 6 performance cores** — parallel insertion and TimeBucket benchmarks
 
-**Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10, 50 search queries. Compiled with `target-cpu=native`.
+**Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10. Compiled with `target-cpu=native`.
 
-### Build and search performance
+### Arena vs naive implementation
 
 | Implementation | Build time | Search (50 queries) | Speedup |
 |---|---|---|---|
 | Arena (MemWeaver) | 187s | 20.4ms | — |
 | Naive (Vec-based) | 322s | 34.9ms | 1.72x slower |
 
-Arena allocation is **1.72x faster** to build and **1.71x faster** to query due to cache locality — collocating each vector with its HNSW edges means graph traversal accesses contiguous memory.
+Arena allocation is **1.72x faster** to build and **1.71x faster** to query. Collocating each vector with its HNSW edges means graph traversal loads vector and edges in one cache access instead of two.
 
 ### Memory predictability
 
@@ -77,6 +79,22 @@ The arena implementation maintains a **constant ~8 MB peak overhead** throughout
 The arena implementation also uses **25% less total RSS** at 1M vectors (608 MB growth vs 759 MB).
 
 ![Memory comparison chart](docs/memory_comparison.png)
+
+### Parallel insertion (Apple M-series, 6 performance cores)
+
+| Method | Build time | Speedup | Mean recall@10 | Min recall |
+|--------|-----------|---------|----------------|------------|
+| Single thread | 156s | 1.0x | 0.959 | 0.40 |
+| Two-phase, 4 threads | 85.8s | 1.82x | 0.953 | 0.000 |
+| Two-phase, 6 threads | 69.8s | 2.24x | 0.965 | 0.20 |
+| TimeBucket n=8 | 84s | 1.86x | 0.940 | 0.40 |
+| TimeBucket n=16 | 62s | 2.52x | 0.949 | 0.40 |
+
+**Throughput:** single thread 7,420 vec/s → two-phase (4 threads) 12,624 vec/s, **1.70x speedup**.
+
+Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Threads search spatially distinct graph regions, avoiding cache contention. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
+
+TimeBucket parallelism works differently — smaller buckets fit in L3 cache, improving cache hit rate from ~5% to ~80%. Both approaches are complementary.
 
 ---
 
@@ -324,7 +342,8 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] gRPC API (BatchInsert, Search, CreateCollection)
 
 **Performance:**
-- [ ] Parallel index construction (level-lock pipelining)
+- [x] Parallel index construction (two-phase batch insertion, 1.70-2.24x speedup)
+- [ ] Fix parallel insertion min recall
 - [ ] Memory controller — automatic eviction policy
 
 **Cold tier optimization:**

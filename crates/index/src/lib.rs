@@ -18,6 +18,6 @@ pub use blob::{
 };
 pub use hnsw::{
     ArenaNodeStore, GraphNode, Hnsw, HnswArena, HnswIndex, HnswNaive, HnswNodeStore,
-    HnswVectorStore, NaiveNodeStore, NodeBlock, NodeId, DEFAULT_ALIGNMENT,
+    HnswVectorStore, NaiveNodeStore, NodeBlock, NodeId, ParallelHnsw, DEFAULT_ALIGNMENT,
 };
 pub use time_bucket::{BucketSeq, BucketedNodeId, ConfigError, TimeBucketIndex};

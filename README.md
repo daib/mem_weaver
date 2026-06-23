@@ -82,19 +82,26 @@ The arena implementation also uses **25% less total RSS** at 1M vectors (608 MB 
 
 ### Parallel insertion (Apple M-series, 6 performance cores)
 
+All variants use M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10, 10,000 queries.
+
 | Method | Build time | Speedup | Mean recall@10 | Min recall |
 |--------|-----------|---------|----------------|------------|
-| Single thread | 156s | 1.0x | 0.959 | 0.40 |
-| Two-phase, 4 threads | 85.8s | 1.82x | 0.953 | 0.000 |
-| Two-phase, 6 threads | 69.8s | 2.24x | 0.965 | 0.20 |
-| TimeBucket n=8 | 84s | 1.86x | 0.940 | 0.40 |
-| TimeBucket n=16 | 62s | 2.52x | 0.949 | 0.40 |
+| Naive (Vec-based) | 160s | 0.76x | 0.965 | 0.300 |
+| Arena single thread | 124s | 1.0x | 0.965 | 0.300 |
+| Arena two-phase, 4 threads | 84s | 1.48x | 0.965 | 0.300 |
+| Arena two-phase, 6 threads | 70s | 1.77x | 0.965 | 0.300 |
+| TimeBucket n=8 | 84s | 1.48x | 0.940 | 0.40 |
+| TimeBucket n=16 | 62s | 2.0x | 0.949 | 0.40 |
 
 **Throughput:** single thread 7,420 vec/s → two-phase (4 threads) 12,624 vec/s, **1.70x speedup**.
+
+All implementations produce **identical recall** — mean=0.965, min=0.300 across naive, arena, single-thread, and parallel variants. The min=0.300 reflects two hard queries (8500, 9049) in sparse regions of SIFT1M that are difficult for M=16 at ef_search=100, not implementation differences.
 
 Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Threads search spatially distinct graph regions, avoiding cache contention. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
 
 TimeBucket parallelism works differently — smaller buckets fit in L3 cache, improving cache hit rate from ~5% to ~80%. Both approaches are complementary.
+
+**Search quality improvement:** upper-level beam search (ef=5 at layers 1+, ef=ef_search at layer 0) replaces greedy descent, escaping local optima in sparse regions. This fixes zero-recall queries that greedy descent gets trapped on.
 
 ---
 
@@ -342,8 +349,8 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] gRPC API (BatchInsert, Search, CreateCollection)
 
 **Performance:**
-- [x] Parallel index construction (two-phase batch insertion, 1.70-2.24x speedup)
-- [ ] Fix parallel insertion min recall
+- [x] Parallel index construction (two-phase batch insertion, 1.48-1.77x speedup on 4-6 cores)
+- [x] Upper-level beam search — replaces greedy descent, eliminates zero-recall local optima traps
 - [ ] Memory controller — automatic eviction policy
 
 **Cold tier optimization:**

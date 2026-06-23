@@ -257,7 +257,7 @@ fn execute_benchmark(c: &mut Criterion, ctx: &SiftCtx, index: &mut dyn HnswIndex
     let mut insert_search_index = || {
         let insert_started = Instant::now();
         for (i, v) in corpus.iter().enumerate() {
-            index.insert(v.as_slice());
+            index.insert(v.as_slice(), i as u64);
             log_rss_after_insert(i + 1, *n_base, *mem_insert_step, insert_started);
         }
         assert_eq!(index.len(), *n_base);
@@ -289,7 +289,7 @@ fn execute_benchmark(c: &mut Criterion, ctx: &SiftCtx, index: &mut dyn HnswIndex
             );
             let insert_started = Instant::now();
             for (i, v) in corpus.iter().enumerate() {
-                arena.insert(v.as_slice());
+                arena.insert(v.as_slice(), i as u64);
                 if *log_mem_inside_build_bench {
                     log_rss_after_insert(i + 1, *n_base, *mem_insert_step, insert_started);
                 }
@@ -361,7 +361,7 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                 );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    arena.insert(v.as_slice());
+                    arena.insert(v.as_slice(), i as u64);
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -380,7 +380,7 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                 );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    naive.insert(v.as_slice());
+                    naive.insert(v.as_slice(), i as u64);
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -425,7 +425,7 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                 );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    arena.insert(v.as_slice());
+                    arena.insert(v.as_slice(), i as u64);
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -443,7 +443,7 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                 );
                 let insert_started = Instant::now();
                 for (i, v) in setup.corpus.iter().enumerate() {
-                    naive.insert(v.as_slice());
+                    naive.insert(v.as_slice(), i as u64);
                     if setup.log_mem_inside_build_bench {
                         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
                     }
@@ -480,7 +480,7 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
     let insert_started = Instant::now();
     let t_warmup_insert = Instant::now();
     for (i, v) in setup.corpus.iter().enumerate() {
-        index.insert(v.as_slice());
+        index.insert(v.as_slice(), i as u64);
         log_rss_after_insert(i + 1, n_base, setup.mem_insert_step, insert_started);
     }
     assert_eq!(index.len(), n_base);

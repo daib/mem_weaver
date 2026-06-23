@@ -15,6 +15,12 @@ pub trait HnswVectorStore: Default {
 #[derive(Debug, Default, Clone)]
 pub struct NaiveVectorStore(Vec<Vec<f32>>);
 
+impl NaiveVectorStore {
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 impl HnswVectorStore for NaiveVectorStore {
     fn store_new(&mut self, id: NodeId, data: &[f32]) -> bool {
         if id != NodeId(self.0.len() as u32) {

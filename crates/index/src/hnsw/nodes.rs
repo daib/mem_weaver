@@ -969,6 +969,9 @@ pub trait HnswNodeStore {
     fn arena_file_names(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Drop all nodes and edges, returning the store to its empty initial state.
+    fn reset(&mut self) {}
 }
 
 impl HnswNodeStore for NaiveNodeStore {
@@ -1052,6 +1055,11 @@ impl HnswNodeStore for NaiveNodeStore {
 
     fn vector_at<'a>(&'a self, id: NodeId, _buf: &'a mut Vec<u8>) -> &'a [f32] {
         self.vector_store.vector_at(id)
+    }
+
+    fn reset(&mut self) {
+        self.nodes.clear();
+        self.vector_store.clear();
     }
 }
 
@@ -1270,6 +1278,12 @@ impl HnswNodeStore for ArenaNodeStore {
             .iter()
             .map(|b| format!("block_{}.arena", b.block_index))
             .collect()
+    }
+
+    fn reset(&mut self) {
+        self.blocks.clear();
+        self.write_count = 1;
+        self.clean_version = 0;
     }
 }
 #[cfg(test)]

@@ -3,6 +3,8 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
+
+use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
@@ -15,11 +17,49 @@ use vector::distance::euclidean_distance_sq;
 
 use super::nodes::{ArenaNodeStore, HnswNodeStore, NaiveNodeStore, NodeId, INVALID_NODE_ID};
 
+// ── Two-phase batch insertion ─────────────────────────────────────────────────
+
+/// Pre-computed insertion plan from [`Hnsw::plan_insert`].
+/// `neighbors_per_level[l]` = `(neighbor_id, dist_sq)` pairs at level `l`.
+struct InsertPlan {
+    level: usize,
+    neighbors_per_level: Vec<Vec<(NodeId, f32)>>,
+}
+
+/// Return `true` if any already-committed batch vector is closer to one of
+/// `plan`'s level-0 neighbors than `plan`'s own recorded distance.
+fn has_closer_committed(plan: &InsertPlan, committed_l0: &[HashMap<NodeId, f32>]) -> bool {
+    let Some(l0) = plan.neighbors_per_level.first() else {
+        return false;
+    };
+    for &(n, v_dist) in l0 {
+        for committed in committed_l0 {
+            if let Some(&u_dist) = committed.get(&n) {
+                if u_dist < v_dist {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ── Public trait ──────────────────────────────────────────────────────────────
+
 /// Façade over [`Hnsw`] (`insert` / `search`).
 /// [`HnswNaive`] / [`HnswArena`] can be used as `dyn HnswIndex`.
 pub trait HnswIndex {
     fn len(&self) -> usize;
+    /// Clear all nodes, edges, and metadata, returning the index to its empty initial state.
+    fn reset(&mut self);
     fn insert(&mut self, vector: &[f32], vector_id: u64) -> NodeId;
+    fn insert_batch_parallel(
+        &mut self,
+        vectors: &[Vec<f32>],
+        vector_ids: &[u64],
+        num_threads: usize,
+    ) -> Vec<NodeId>;
+
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)>;
     /// Populate the index's arena from `block_*.arena` files in `dir`, replacing any
     /// existing blocks. Used during crash recovery. No-op for non-arena indexes.
@@ -113,6 +153,11 @@ where
     }
 }
 
+// SAFETY: `rng: StdRng` is `!Sync`, but it is only accessed sequentially.
+// The rayon phase-1 par_iter is read-only and never touches `rng`. Callers
+// must not invoke any mutating method concurrently with phase-1 reads.
+unsafe impl<N: HnswNodeStore + Send + Sync> Sync for Hnsw<N> {}
+
 impl Hnsw<NaiveNodeStore> {
     /// `m`: target max degree on levels `> 0`. Level 0 allows up to `m_max0` (often `2 * m`).
     ///
@@ -149,14 +194,33 @@ impl Hnsw<NaiveNodeStore> {
     }
 }
 
-impl<N: HnswNodeStore> HnswIndex for Hnsw<N> {
+impl<N: HnswNodeStore + Send + Sync> HnswIndex for Hnsw<N> {
     fn len(&self) -> usize {
         Hnsw::len(self)
+    }
+
+    fn reset(&mut self) {
+        self.graph.reset();
+        self.entry_point = None;
+        self.max_depth = -1;
+        self.node_ids.clear();
+        self.vector_ids.clear();
+        self.levels.clear();
+        self.node_to_vector_id.clear();
     }
 
     fn insert(&mut self, vector: &[f32], vector_id: u64) -> NodeId {
         // Call inherent `Hnsw::insert`, not this trait method (same name would recurse).
         Hnsw::insert(self, vector, vector_id)
+    }
+
+    fn insert_batch_parallel(
+        &mut self,
+        vectors: &[Vec<f32>],
+        vector_ids: &[u64],
+        num_threads: usize,
+    ) -> Vec<NodeId> {
+        Hnsw::insert_batch_parallel(self, vectors, vector_ids, num_threads)
     }
 
     fn search(&self, query: &[f32], k: usize, ef: usize) -> Vec<(u64, f32)> {
@@ -332,7 +396,6 @@ impl<N: HnswNodeStore> Hnsw<N> {
 
         // select a random level for the new node
         let level = self.random_level();
-        let q_buf = vector;
         let new_id = self
             .graph
             .push_node(vector, level)
@@ -342,47 +405,10 @@ impl<N: HnswNodeStore> Hnsw<N> {
         self.levels.push(level as u8);
         self.node_to_vector_id.insert(new_id.0, vector_id);
 
-        // Store the entry point, e.g., the first point to search
-        if self.entry_point.is_none() {
-            self.entry_point = Some(new_id);
-            self.max_depth = level as i32;
-            return new_id;
-        }
+        let plan = self.plan_insert(vector, level);
+        self.commit_plan(new_id, &plan);
 
-        let mut ep = self.entry_point.expect("non-empty");
-
-        {
-            let q = q_buf;
-            let mut lc = self.max_depth;
-            // for all the levels above the new node's level, find the closest node greedily
-            while lc > level as i32 {
-                // find the closest node from the entry point to the current level
-                ep = self.greedy_closest(q, ep, lc as usize);
-                // move to the next level
-                lc -= 1;
-            }
-
-            for lc in (0..=level).rev() {
-                // find the ef closest candidates for the current level
-                let candidates = if lc <= self.max_depth as usize {
-                    self.search_level(q, ep, self.ef_construction, lc)
-                } else {
-                    Vec::new()
-                };
-                // retain only the m closest candidates
-                let cap = if lc == 0 { self.m_max0 } else { self.m };
-                let selected = (self.closest_m_candidates)(&candidates, cap);
-                // create bidirectional edges between the new node and the selected candidates
-                self.update_neighbors(new_id, &selected, lc);
-
-                // select the best candidate of the current level as the new entry point for the next level
-                if let Some(&best) = selected.first() {
-                    ep = best;
-                }
-            }
-        }
-
-        if level as i32 > self.max_depth {
+        if self.entry_point.is_none() || level as i32 > self.max_depth {
             self.max_depth = level as i32;
             self.entry_point = Some(new_id);
         }
@@ -404,21 +430,30 @@ impl<N: HnswNodeStore> Hnsw<N> {
         let mut ep = self.entry_point.expect("non-empty");
         let mut lc = self.max_depth;
 
-        while lc > 0 {
+        while lc > 3 {
             ep = self.greedy_closest(query, ep, lc as usize);
             lc -= 1;
         }
 
-        let mut cands = self.search_level(query, ep, ef, 0);
-        cands.sort_by(|a, b| a.1.total_cmp(&b.1));
-        cands.truncate(k);
-        cands
-            .into_iter()
-            .map(|(node_id, dist)| {
-                let vid = self.node_to_vector_id[&node_id.0];
-                (vid, dist)
-            })
-            .collect()
+        for l in (0..=lc).rev() {
+            let this_ef = if l == 0 { ef } else { 5 };
+            // perform beam search at higher levels to avoid local minima
+            let mut cands = self.search_level(query, ep, this_ef, l as usize);
+            if l > 0 {
+                ep = cands.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+            } else {
+                cands.sort_by(|a, b| a.1.total_cmp(&b.1));
+                cands.truncate(k);
+                return cands
+                    .into_iter()
+                    .map(|(node_id, dist)| {
+                        let vid = self.node_to_vector_id[&node_id.0];
+                        (vid, dist)
+                    })
+                    .collect();
+            }
+        }
+        return Vec::new();
     }
 
     fn greedy_closest(&self, q: &[f32], mut best: NodeId, level: usize) -> NodeId {
@@ -448,6 +483,7 @@ impl<N: HnswNodeStore> Hnsw<N> {
         best
     }
 
+    // Return the closest `ef` neighbors of `ep` at `level` in the graph with node ids and distances.
     fn search_level(&self, q: &[f32], ep: NodeId, ef: usize, level: usize) -> Vec<(NodeId, f32)> {
         let mut visited = HashSet::with_capacity(2 * ef);
         visited.insert(ep);
@@ -688,6 +724,173 @@ impl<N: HnswNodeStore> Hnsw<N> {
         // save the neighbors of the current node at the given level, e.g., the edges from this node to the neighbors
         graph.save_neighbors(nid, good_neighbors.as_slice(), level);
     }
+
+    // ── Two-phase batch insertion ─────────────────────────────────────────────
+
+    /// Insert `vectors` using a two-phase strategy with rayon parallelism.
+    ///
+    /// Phase 1 (parallel, read-only): compute neighbor candidates for every
+    /// vector in each chunk concurrently. Phase 2 (sequential): allocate nodes
+    /// and commit pre-computed edges, deferring vectors whose plans are stale.
+    ///
+
+    pub fn insert_batch_parallel(
+        &mut self,
+        vectors: &[Vec<f32>],
+        vector_ids: &[u64],
+        num_threads: usize,
+    ) -> Vec<NodeId>
+    where
+        N: Send + Sync,
+    {
+        assert_eq!(vectors.len(), vector_ids.len());
+        if vectors.is_empty() {
+            return Vec::new();
+        }
+
+        let mut all_ids = Vec::with_capacity(vectors.len());
+        let mut start = 0;
+
+        // Seed with ef_construction sequential inserts so phase-1 beam search
+        // has enough graph structure to work with.
+        if self.entry_point.is_none() {
+            let seed_n = self.ef_construction.min(vectors.len());
+            for i in 0..seed_n {
+                all_ids.push(self.insert(&vectors[i], vector_ids[i]));
+            }
+            start = seed_n;
+        }
+
+        for (vec_chunk, id_chunk) in vectors[start..]
+            .chunks(num_threads)
+            .zip(vector_ids[start..].chunks(num_threads))
+        {
+            all_ids.extend(self.two_phase_parallel(vec_chunk, id_chunk));
+        }
+
+        all_ids
+    }
+
+    fn two_phase_parallel(&mut self, vectors: &[Vec<f32>], vector_ids: &[u64]) -> Vec<NodeId>
+    where
+        N: Send + Sync,
+    {
+        let levels: Vec<usize> = vectors.iter().map(|_| self.random_level()).collect();
+
+        // Phase 1: parallel neighbor search (read-only).
+        // SAFETY: the closure only reads graph data; no mutation happens until
+        // phase 2a begins after collect() returns.
+        let s: &Self = self;
+        let plans: Vec<InsertPlan> = vectors
+            .par_iter()
+            .zip(levels.par_iter())
+            .map(|(vector, &level)| s.plan_insert(vector, level))
+            .collect();
+
+        // Phase 2a: sequential node allocation.
+        let mut node_ids = Vec::with_capacity(vectors.len());
+        for (i, (vector, plan)) in vectors.iter().zip(plans.iter()).enumerate() {
+            let vid = vector_ids[i];
+            let new_id = self
+                .graph
+                .push_node(vector, plan.level)
+                .expect("HNSW node allocation failed (arena OOM)");
+            self.node_ids.push(new_id);
+            self.vector_ids.push(vid);
+            self.levels.push(plan.level as u8);
+            self.node_to_vector_id.insert(new_id.0, vid);
+            node_ids.push(new_id);
+        }
+
+        // Phase 2b: commit edges with conflict detection.
+        let mut committed_l0: Vec<HashMap<NodeId, f32>> = Vec::new();
+        let mut deferred: Vec<usize> = Vec::new();
+
+        for i in 0..vectors.len() {
+            if has_closer_committed(&plans[i], &committed_l0) {
+                deferred.push(i);
+                continue;
+            }
+            self.commit_plan(node_ids[i], &plans[i]);
+            if plans[i].level as i32 > self.max_depth {
+                self.max_depth = plans[i].level as i32;
+                self.entry_point = Some(node_ids[i]);
+            }
+            committed_l0.push(
+                plans[i]
+                    .neighbors_per_level
+                    .first()
+                    .map(|l0| l0.iter().cloned().collect())
+                    .unwrap_or_default(),
+            );
+        }
+
+        // Phase 2c: re-plan deferred vectors against the committed graph.
+        for &i in &deferred {
+            let fresh = self.plan_insert(&vectors[i], plans[i].level);
+            self.commit_plan(node_ids[i], &fresh);
+            if fresh.level as i32 > self.max_depth {
+                self.max_depth = fresh.level as i32;
+                self.entry_point = Some(node_ids[i]);
+            }
+        }
+
+        node_ids
+    }
+
+    fn plan_insert(&self, vector: &[f32], level: usize) -> InsertPlan {
+        let mut neighbors_per_level = vec![Vec::new(); level + 1];
+
+        let Some(mut ep) = self.entry_point else {
+            return InsertPlan {
+                level,
+                neighbors_per_level,
+            };
+        };
+
+        let mut lc = self.max_depth;
+        // for all the levels above the new node's level, find the closest node greedily
+        while lc > level as i32 {
+            // find the closest node from the entry point to the current level
+            ep = self.greedy_closest(vector, ep, lc as usize);
+            // move to the next level
+            lc -= 1;
+        }
+
+        // Beam search + neighbor selection at each level.
+        for l in (0..=level).rev() {
+            let candidates = if (l as i32) <= self.max_depth {
+                self.search_level(vector, ep, self.ef_construction, l)
+            } else {
+                Vec::new()
+            };
+            // retain only the m closest candidates
+            let cap = if l == 0 { self.m_max0 } else { self.m };
+            let selected_ids = (self.closest_m_candidates)(&candidates, cap);
+            let dist_map: HashMap<NodeId, f32> = candidates.into_iter().collect();
+            let selected: Vec<(NodeId, f32)> = selected_ids
+                .into_iter()
+                .map(|n| (n, dist_map.get(&n).copied().unwrap_or(f32::MAX)))
+                .collect();
+            // select the closest candidate as the new entry point for the next level
+            if let Some((&best, _)) = dist_map.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()) {
+                ep = best;
+            }
+            neighbors_per_level[l] = selected;
+        }
+
+        InsertPlan {
+            level,
+            neighbors_per_level,
+        }
+    }
+
+    fn commit_plan(&mut self, nid: NodeId, plan: &InsertPlan) {
+        for (l, neighbors) in plan.neighbors_per_level.iter().enumerate() {
+            let neighbor_ids: Vec<NodeId> = neighbors.iter().map(|&(n, _)| n).collect();
+            self.update_neighbors(nid, &neighbor_ids, l);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -697,6 +900,63 @@ mod tests {
     use super::super::{HnswArena, HnswNaive};
     use super::*;
     use rand::SeedableRng;
+
+    fn make_plan(level: usize, l0_neighbors: Vec<(NodeId, f32)>) -> InsertPlan {
+        let mut neighbors_per_level = vec![Vec::new(); level + 1];
+        neighbors_per_level[0] = l0_neighbors;
+        InsertPlan {
+            level,
+            neighbors_per_level,
+        }
+    }
+
+    fn make_committed(entries: &[(NodeId, f32)]) -> HashMap<NodeId, f32> {
+        entries.iter().cloned().collect()
+    }
+
+    #[test]
+    fn test_has_closer_committed() {
+        // Empty committed slice.
+        let plan = make_plan(0, vec![(NodeId(0), 1.0), (NodeId(1), 2.0)]);
+        assert!(!has_closer_committed(&plan, &[]));
+
+        // Empty plan neighbors.
+        let plan_empty = make_plan(0, vec![]);
+        assert!(!has_closer_committed(
+            &plan_empty,
+            &[make_committed(&[(NodeId(0), 0.5)])]
+        ));
+
+        // Committed shares no neighbors with the plan.
+        let plan = make_plan(0, vec![(NodeId(0), 1.0)]);
+        assert!(!has_closer_committed(
+            &plan,
+            &[make_committed(&[(NodeId(1), 0.5)])]
+        ));
+
+        // Committed shares a neighbor but is farther.
+        assert!(!has_closer_committed(
+            &plan,
+            &[make_committed(&[(NodeId(0), 2.0)])]
+        ));
+
+        // Committed shares a neighbor and is closer.
+        assert!(has_closer_committed(
+            &plan,
+            &[make_committed(&[(NodeId(0), 0.5)])]
+        ));
+
+        // Multiple neighbors and committed: no entry closer than the plan.
+        let plan = make_plan(0, vec![(NodeId(0), 1.0), (NodeId(1), 2.0)]);
+        let far_a = make_committed(&[(NodeId(0), 1.5)]);
+        let far_b = make_committed(&[(NodeId(1), 3.0)]);
+        assert!(!has_closer_committed(&plan, &[far_a, far_b]));
+
+        // Multiple committed: second is closer to NodeId(1).
+        let no_overlap = make_committed(&[(NodeId(0), 1.5)]);
+        let closer = make_committed(&[(NodeId(1), 1.5)]);
+        assert!(has_closer_committed(&plan, &[no_overlap, closer]));
+    }
 
     #[test]
     fn hnsw_naive_recalls_bruteforce_small() {

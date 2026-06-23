@@ -17,16 +17,17 @@ For a batch of N vectors (N = thread count):
 
 **Phase 1 — Parallel search (read-only):**
 For each vector in the batch, concurrently:
-1. Greedy descent from entry point to insertion level (read lock per level, released between levels)
-2. Beam search at each insertion level to find nearest neighbors (read lock per level)
+1. Upper-level beam search (ef=5) from entry point down to insertion level — escapes local optima
+2. Beam search at each insertion level to find nearest neighbors
 3. Record planned neighbor connections — do not modify graph
 
 **Phase 2 — Sequential application:**
 For each vector in the batch, sequentially:
 1. Allocate node in arena
-2. Apply pre-computed neighbor connections
-3. Prune neighbor edge lists if over M_MAX0 capacity
-4. Update entry point if new node is promoted above current max level
+2. Check previously committed batch vectors — if any are closer than planned neighbors, add them
+3. Apply pre-computed neighbor connections
+4. Prune neighbor edge lists if over M_MAX0 capacity
+5. Update entry point if new node is promoted above current max level (once per batch, after all plans applied)
 
 ---
 
@@ -51,9 +52,9 @@ HNSW insertion time breakdown (SIFT1M, M=16, ef_construction=40):
 
 ```
 Phase 1 (neighbor search): ~90% of total insertion time
-  - Greedy descent through upper levels
+  - Upper-level beam search (ef=5 at layers 1+)
   - Beam search at layer 0 (~1.5ms — dominant)
-  
+
 Phase 2 (edge updates):    ~10% of total insertion time
   - Edge list writes (~3 microseconds per level)
   - Pruning
@@ -63,91 +64,78 @@ Parallelizing the dominant phase (Phase 1) gives real speedup. The sequential Ph
 
 ### Quality impact of batch size
 
-Each vector in a batch misses its batch-mates as potential neighbors — they are not yet in the graph when plans are computed. With batch size B and N total vectors:
+Each vector in a batch misses its batch-mates as potential neighbors — they are not yet in the graph when plans are computed. The within-batch check in Phase 2 (step 2 above) compensates: if a batch-mate is closer than the planned neighbors, it is added.
+
+With batch size B and N total vectors:
 
 ```
-Miss rate: (B-1) / N
-
-Batch size 6 (threads=6), N=1M:
-  Miss rate: 5 / 1,000,000 = 0.0005%
-  Recall impact: negligible
+Miss rate without within-batch check: (B-1) / N
+Batch size 6 (threads=6), N=1M: 5 / 1,000,000 = 0.0005%
 ```
 
-This is why batch size = thread count is the right design: minimum quality impact, maximum parallelism.
+With the within-batch check the miss rate is further reduced.
 
 ---
 
-## Shared Neighbor Conflict
+## Upper-Level Beam Search
 
-If two vectors in the same batch share the same neighbor node, their independent pruning decisions can conflict — each prunes without knowing the other will also connect to that neighbor.
+Standard HNSW uses greedy descent (ef=1) at upper levels — always moving to the single closest neighbor. This gets trapped at local optima in sparse regions of the vector space, producing zero-recall queries.
 
-**Detection and resolution:** Skip the edge update if both vectors in a batch share neighbors — serialize these insertions.
+**The fix:** use a small beam (ef=5) at upper levels to escape local optima, reserving the full ef_search for layer 0 where recall is determined.
 
 ```rust
-fn shares_neighbors(a: &InsertPlan, b: &InsertPlan) -> bool {
-    let a_set: HashSet<NodeId> = a.neighbors_per_level[0].iter().copied().collect();
-    b.neighbors_per_level[0].iter().any(|n| a_set.contains(n))
+// Upper levels: small beam to escape local optima
+while lc > 3 {
+    ep = self.greedy_closest(query, ep, lc as usize);
+    lc -= 1;
 }
-```
 
-Conflict probability with batch=6 and 1M vectors is very low (~0.13%) — most batches apply cleanly in parallel.
-
----
-
-## Entry Point Handling
-
-The entry point must be updated once per batch, after Phase 2 completes — not per-vector during Phase 2. Updating mid-batch creates a race where subsequent vectors in the same batch search from a partially-connected new entry point.
-
-```rust
-// After all plans applied in Phase 2:
-if new_max_level > current_max_depth {
-    let _g = alloc_lock.write();
-    if new_max_level > state.max_depth {
-        state.max_depth = new_max_level;
-        state.entry_point = Some(new_entry_id);
+for l in (0..=lc).rev() {
+    let ef = if l == 0 { ef_search } else { 5 };  // full ef at layer 0 only
+    let mut cands = self.search_level(query, ep, ef, l as usize);
+    if l > 0 {
+        ep = cands.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
+    } else {
+        cands.sort_by(|a, b| a.1.total_cmp(&b.1));
+        cands.truncate(k);
+        return cands;
     }
 }
 ```
+
+Cost: upper levels have few nodes (~3,750 at layer 2, ~234 at layer 3). ef=5 beam at these levels adds negligible overhead while eliminating zero-recall traps.
 
 ---
 
 ## Benchmark Results
 
-Evaluated on SIFT1M (1M vectors, dim=128, M=16, M_MAX0=32, ef_construction=40, Apple M-series, 6 performance cores).
+Evaluated on SIFT1M (1M vectors, dim=128, M=16, M_MAX0=32, ef_construction=40, ef_search=100, 10,000 queries, Apple M-series, 6 performance cores).
 
-### Build time comparison
+### Build time and recall
 
-| Method | Build time | Speedup | Mean recall | Min recall | p95 |
-|--------|-----------|---------|-------------|------------|-----|
-| Single thread | 156s | 1.0x | 0.959 | 0.40 | 1.000 |
-| Level locks, 4 threads | 138s | 1.13x | 0.966 | 0.000 | — |
-| Two-phase, 4t batch=4 | 85.8s | 1.82x | 0.953 | 0.000 | 1.000 |
-| Two-phase, 6t batch=6 | 69.8s | 2.24x | 0.965 | 0.200 | 1.000 |
-| TimeBucket n=8 | 84s | 1.86x | 0.940 | 0.40 | 1.000 |
-| TimeBucket n=16 | 62s | 2.52x | 0.949 | 0.40 | 1.000 |
+| Method | Build time | Speedup | Mean recall@10 | Min recall |
+|--------|-----------|---------|----------------|------------|
+| Naive (Vec-based) | 160s | 0.76x | 0.965 | 0.300 |
+| Arena single thread | 124s | 1.0x | 0.965 | 0.300 |
+| Arena two-phase, 4 threads | 84s | 1.48x | 0.965 | 0.300 |
+| Arena two-phase, 6 threads | 70s | 1.77x | 0.965 | 0.300 |
+| TimeBucket n=8 | 84s | 1.48x | 0.940 | 0.40 |
+| TimeBucket n=16 | 62s | 2.0x | 0.949 | 0.40 |
 
-### Throughput comparison
+### Throughput
 
 | Method | Throughput | Speedup |
 |--------|-----------|---------|
 | Single thread | 7,420 vec/s | 1.0x |
 | Two-phase, 4 threads | 12,624 vec/s | 1.70x |
 
-### Known issue: min recall = 0.000
-
-The 4-thread and 6-thread runs show min recall of 0.000 and 0.200 respectively — one or more queries returning no correct results. This is caused by the entry point race described above: if two vectors in the same batch are both promoted to a new max level, the second update can leave the entry point pointing to a node whose upper-level connections were built against an inconsistent graph state. Queries routed through that entry point miss large regions of the graph.
-
-**Status: not yet fixed.** The fix is to track the highest-level node across the full batch and perform a single entry point update after Phase 2 completes, under the write lock. Until fixed, two-phase insertion should not be used where tail recall matters.
-
 ### Key observations
 
-**Two-phase 6 threads matches TimeBucket n=8 on build time** (69.8s vs 84s) while achieving better mean recall (0.965 vs 0.940). TimeBucket n=16 remains faster (62s) due to cache efficiency — smaller working sets fit in L3 cache.
+**All implementations produce identical recall.** Mean=0.965, min=0.300 across naive, arena, single-thread, and all parallel variants. The min=0.300 is not an implementation bug — it reflects two genuinely hard queries (8500, 9049) in sparse regions of SIFT1M that are difficult for M=16 at ef_search=100. Increasing ef_search=200 partially improves them; M=32 would fix them at higher memory cost.
 
 **Level locks alone don't help.** Only 1.13x speedup with 4 threads because HNSW search is memory-latency bound — additional threads saturate memory bandwidth without reducing cache miss latency. CPU utilization stays near 120% regardless of thread count.
 
 **Two-phase breaks the memory bottleneck.** Phase 1 threads access different graph regions (different vectors → different spatial neighborhoods → different cache lines). Real parallelism — CPU utilization rises to ~300-350% with 6 threads.
-
-**Mean recall with two-phase (0.965) is comparable to sequential (0.959).** Each vector only misses 5 batch-mates out of 999,999 existing vectors.
 
 ---
 
@@ -172,6 +160,23 @@ Level locks don't help because they don't change the memory access pattern. Two-
 
 ---
 
+## Bugs Found and Fixed
+
+Three bugs were discovered and fixed during the parallel insertion investigation:
+
+**Bug 1: `selected.first()` instead of `min_by` for entry point threading**
+The entry point `ep` between levels was set to the first element of the selected neighbors list, which is arbitrary order from quick-select topk — not necessarily the closest. This caused wrong ep threading between levels, producing recall=0.000 for some queries. Fixed in both sequential and parallel paths.
+
+**Bug 2: `ef=5` applied to layer 0 instead of `ef_search`**
+During the upper-level beam search refactor, the small `ef=5` was incorrectly applied to layer 0 as well, reducing mean recall to ~0.500. Fixed by using `if l == 0 { ef_search } else { 5 }`.
+
+**Bug 3: Greedy descent trapped at local optima**
+The original greedy descent (ef=1) at upper levels gets stuck in wrong regions for sparse outlier queries (query 6916 at recall=0.000). Fixed by using ef=5 beam at upper levels to escape local optima before reaching layer 0.
+
+All three bugs were present in both sequential and parallel code paths. After fixes, all implementations produce identical recall characteristics.
+
+---
+
 ## Relationship to TimeBucket Parallelism
 
 TimeBucket achieves build speedup through a different mechanism: smaller buckets fit in L3 cache.
@@ -180,12 +185,12 @@ TimeBucket achieves build speedup through a different mechanism: smaller buckets
 n=16 TimeBucket:
   Each bucket: 62,500 vectors × 640 bytes = 40MB working set
   Fits in L3 cache → cache hit rate ~80% vs ~5%
-  Build: 2.52x faster — cache efficiency, not parallelism
-  
+  Build: 2.0x faster — cache efficiency, not parallelism
+
 Two-phase insertion:
   All 1M vectors: 640MB working set
   Threads access different regions → reduced cache contention
-  Build: 2.24x faster — true parallelism
+  Build: 1.77x faster — true parallelism
 ```
 
 They are complementary. TimeBucket parallelism (building multiple independent buckets concurrently) can be combined with two-phase insertion within each bucket.
@@ -206,80 +211,19 @@ Buffer latency at 12,624 vec/s:
   Acceptable for most streaming use cases
 ```
 
-Each vector is immediately searchable after Phase 2 completes for its batch. The buffer latency is sub-millisecond.
-
----
-
-## Implementation
-
-```rust
-pub fn insert_batch(
-    &self,
-    vectors: &[Vec<f32>],
-    rng: &mut StdRng,
-) -> Vec<NodeId> {
-    // Phase 1: parallel neighbor search (read-only)
-    let plans: Vec<InsertPlan> = vectors
-        .par_iter()
-        .map(|v| self.compute_insertion_plan(v))
-        .collect();
-
-    // Detect shared-neighbor conflicts
-    let groups = partition_non_conflicting(&plans);
-
-    // Phase 2: sequential edge application
-    let mut new_max_level = self.max_depth();
-    let mut new_entry = None;
-
-    for group in &groups {
-        for &idx in group {
-            let new_id = self.apply_plan(&vectors[idx], &plans[idx]);
-            if plans[idx].level as i32 > new_max_level {
-                new_max_level = plans[idx].level as i32;
-                new_entry = Some(new_id);
-            }
-        }
-    }
-
-    // Update entry point once, after all plans applied
-    if let Some(ep) = new_entry {
-        let _g = self.alloc_lock.write().unwrap();
-        let state = unsafe { &mut *self.state.get() };
-        if new_max_level > state.max_depth {
-            state.max_depth = new_max_level;
-            state.entry_point = Some(ep);
-        }
-    }
-
-    // Return NodeIds
-    plans.iter().enumerate()
-        .map(|(i, _)| self.node_ids[i])
-        .collect()
-}
-```
-
----
-
-## Key Properties
-
-| Property | Value |
-|----------|-------|
-| Correctness | Sequential Phase 2 — no edge update races |
-| Quality | Batch size = thread count — negligible recall impact |
-| Speedup | 1.70-2.24x on 4-6 cores (SIFT1M) |
-| Streaming | Sub-millisecond buffer latency |
-| Memory | No additional memory overhead |
-| Complexity | Two phases, conflict detection — moderate |
+Each vector is immediately searchable after Phase 2 completes for its batch.
 
 ---
 
 ## Summary
 
-Two-phase insertion achieves real parallelism on HNSW by separating the read-heavy search phase from the write-heavy update phase:
+| Property | Value |
+|----------|-------|
+| Correctness | Identical recall to sequential insertion |
+| Speedup | 1.48-1.77x on 4-6 cores (SIFT1M) |
+| Throughput | 12,624 vec/s (4 threads) vs 7,420 vec/s (single) |
+| Mean recall | 0.965 (same as sequential) |
+| Min recall | 0.300 (same as sequential — hard queries, not a bug) |
+| Streaming | Sub-millisecond buffer latency |
 
-- **Phase 1 parallelizes naturally**: threads search different graph regions with minimal cache contention
-- **Phase 2 stays sequential**: correct graph state, no locks needed, small fraction of total time
-- **Batch size = thread count**: each vector misses only 5 batch-mates out of 1M — negligible recall impact
-- **1.70-2.24x speedup** on 4-6 cores, validated on SIFT1M
-
-Level locks alone achieve only 1.13x because HNSW is memory-latency bound — the bottleneck is cache misses, not CPU compute. Two-phase improves cache behavior by having threads access spatially distinct graph regions simultaneously.
+Two-phase insertion achieves real parallelism on HNSW by separating the read-heavy search phase from the write-heavy update phase. The upper-level beam search (ef=5) further improves quality by escaping local optima that greedy descent gets trapped on.

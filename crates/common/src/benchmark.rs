@@ -31,7 +31,28 @@ pub struct RecallStats {
     pub p95: f32,
 }
 
-fn compute_recall_stats(recalls: &mut [f32]) -> RecallStats {
+/// Brute-force top-`k` by L2² returning `(id, distance)` pairs sorted ascending.
+pub fn brute_force_topk(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<(u64, f32)> {
+    let mut scored: Vec<(u64, f32)> = corpus
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as u64, euclidean_distance_sq(query, v)))
+        .collect();
+    scored.sort_by(|a, b| a.1.total_cmp(&b.1));
+    scored.truncate(k);
+    scored
+}
+
+/// Nearest-rank percentile over a latency slice (sorts in place).
+pub fn latency_percentile(latencies_ms: &mut [f64], pct: f64) -> f64 {
+    latencies_ms.sort_by(|a, b| a.total_cmp(b));
+    let idx = ((latencies_ms.len() as f64 * pct / 100.0).ceil() as usize)
+        .saturating_sub(1)
+        .min(latencies_ms.len() - 1);
+    latencies_ms[idx]
+}
+
+pub fn compute_recall_stats(recalls: &mut [f32]) -> RecallStats {
     if recalls.is_empty() {
         return RecallStats {
             min: 0.0,

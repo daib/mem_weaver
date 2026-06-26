@@ -662,7 +662,6 @@ impl MemWeaverService {
                 entry.m_max0,
                 entry.ef_construction,
                 bucket_duration,
-                top_k_quickselect,
                 rand::rngs::StdRng::seed_from_u64(0),
             ) {
                 Ok(idx) => idx,
@@ -869,7 +868,6 @@ impl MemWeaver for MemWeaverService {
             r.m_max0 as usize,
             r.ef_construction as usize,
             bucket_duration,
-            top_k_quickselect,
             StdRng::seed_from_u64(0),
         )
         .map_err(|e| invalid(format!("invalid index config: {e}")))?;

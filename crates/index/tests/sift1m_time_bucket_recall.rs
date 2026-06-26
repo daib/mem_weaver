@@ -44,7 +44,7 @@ const RNG_SEED: u64 = 0x_4853_4E57_5F53_4954;
 
 const DEFAULT_NUM_BASE_VECTORS: usize = 10_000;
 const DEFAULT_NUM_QUERIES: usize = 10;
-const DEFAULT_EF_CONSTRUCTION: usize = 200;
+const DEFAULT_EF_CONSTRUCTION: usize = 100;
 const DEFAULT_SEARCH_EF: usize = 100;
 const DEFAULT_BUCKET_COUNTS: &[usize] = &[4];
 
@@ -157,7 +157,6 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
             M_MAX0,
             ef_construction,
             bucket_duration,
-            top_k_quickselect,
             StdRng::seed_from_u64(RNG_SEED),
         )
         .expect("valid TimeBucketIndex config");

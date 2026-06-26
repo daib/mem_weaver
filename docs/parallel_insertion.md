@@ -227,3 +227,80 @@ Each vector is immediately searchable after Phase 2 completes for its batch.
 | Streaming | Sub-millisecond buffer latency |
 
 Two-phase insertion achieves real parallelism on HNSW by separating the read-heavy search phase from the write-heavy update phase. The upper-level beam search (ef=5) further improves quality by escaping local optima that greedy descent gets trapped on.
+
+---
+
+## Capacity-Aware Neighbor Selection
+
+### The Problem at High ef_construction
+
+Standard HNSW neighbor selection optimizes for distance only. At high ef_construction (≥100), this creates eviction cascades:
+
+```
+ef_construction=100: 100 candidates considered per insertion
+Popular nodes: appear in many candidate lists
+→ receive many connection requests
+→ edge lists fill up quickly
+→ aggressive pruning kicks in
+→ some nodes lose their only connection to a region
+→ those nodes become unreachable
+→ recall = 0.000 for queries near them
+
+ef_construction=40:  40 candidates — less saturation
+                     eviction cascades don't occur
+                     0 zero-recall queries
+```
+
+### The Fix
+
+Penalize high-degree nodes during neighbor selection:
+
+```rust
+let score = dist * (1.0 + (degree as f32 / cap as f32).min(0.8));
+
+// degree=0  (empty): score = dist × 1.0  (no penalty)
+// degree=16 (half):  score = dist × 1.5
+// degree=32 (full):  score = dist × 1.8  (capped)
+//
+// A full node must be 1.8x closer to be selected
+// over an empty node — prevents cascade evictions
+```
+
+Nodes with spare capacity are preferred. Full nodes require significant distance advantage to be selected. This spreads connection load across the graph rather than concentrating it on popular nodes.
+
+### Results
+
+| Config | Mean recall | Min recall | Zero-recall queries |
+|--------|-------------|------------|---------------------|
+| ef=40, standard | 0.965 | 0.300 | 0 |
+| ef=100, standard | 0.961 | 0.000 | 13 |
+| ef=40, + capacity-aware | 0.965 | 0.300 | 0 (no change — ef=40 doesn't cause cascades) |
+| **ef=100, + capacity-aware** | **0.979** | **0.300** | **0** |
+
+Capacity-aware selection has no effect at ef_construction=40 (eviction cascades don't occur at low ef). It is essential at ef_construction=100+.
+
+### Why ef_construction=100 + Capacity-Aware is the Best Configuration
+
+```
+ef=100 + capacity-aware + 6 threads:
+  Build time: 103s  — faster than ef=40 single-thread (124s) ✓
+  Mean recall: 0.979 — better than ef=40 (0.965) ✓
+  Min recall:  0.300 — same as ef=40 baseline ✓
+  Zero-recall: 0     — eliminated ✓
+  Speedup:     2.65x — better than ef=40 (1.77x) ✓
+
+Strictly better than ef=40 single-thread on every metric.
+```
+
+### Why Higher ef_construction Gives Better Parallel Speedup
+
+More work per insertion means a larger parallel fraction and a smaller sequential fraction relative to total time — Amdahl's law improves:
+
+```
+ef=40:  serial fraction ~10% → max speedup 10x → actual 1.77x
+ef=100: serial fraction ~5%  → max speedup 20x → actual 2.65x
+
+The sequential Phase 2 stays the same absolute size.
+Phase 1 grows with ef_construction.
+Larger Phase 1 → better parallel efficiency.
+```

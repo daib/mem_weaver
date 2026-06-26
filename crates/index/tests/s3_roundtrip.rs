@@ -23,7 +23,6 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use common::top_k_quickselect;
 use futures::stream::StreamExt;
 use index::{download_arena_dir, upload_arena_dir, HnswArena, HnswIndex};
 use object_store::{path::Path as ObjectPath, ObjectStore};
@@ -71,7 +70,6 @@ async fn upload_arena_to_s3_then_download_and_query() {
         32,
         EF,
         N, // one block per arena page is plenty for N=256
-        top_k_quickselect,
         StdRng::seed_from_u64(0xABCD_1234),
     );
     let mut rng = StdRng::seed_from_u64(0x7777);

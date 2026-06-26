@@ -20,7 +20,7 @@ use common::Timestamp;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::hnsw::{HnswArena, HnswIndex, NodeId};
+use crate::hnsw::{HnswArena, HnswIndex};
 
 /// Default node-block capacity hint passed to [`HnswArena`] on bucket creation.
 /// The arena auto-extends, so this is only a first-block sizing hint.
@@ -94,7 +94,6 @@ pub struct TimeBucketIndex {
     /// Length of each time window in the same units as the `timestamp` passed to
     /// [`insert`](TimeBucketIndex::insert).
     bucket_duration: Duration,
-    closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
     buckets: VecDeque<Bucket>,
     next_seq: BucketSeq,
     rng: StdRng,
@@ -127,7 +126,6 @@ impl TimeBucketIndex {
         m_max0: usize,
         ef_construction: usize,
         bucket_duration: Duration,
-        closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
         rng: StdRng,
     ) -> Result<Self, ConfigError> {
         if dim == 0 {
@@ -151,7 +149,6 @@ impl TimeBucketIndex {
             m_max0,
             ef_construction,
             bucket_duration,
-            closest_m_candidates,
             buckets: VecDeque::new(),
             next_seq: BucketSeq(0),
             rng,
@@ -270,7 +267,6 @@ impl TimeBucketIndex {
             self.m_max0,
             self.ef_construction,
             NODE_BLOCK_CAPACITY,
-            self.closest_m_candidates,
             bucket_rng,
         ));
         self.buckets.push_front(Bucket {
@@ -336,9 +332,6 @@ impl TimeBucketIndex {
     /// over how temporal position influences ranking. Pass `|_, d| d` for a pure
     /// semantic search with no temporal bias.
     ///
-    /// `top_k_fn`: selects the `k` results with smallest adjusted distance from the
-    /// per-bucket candidate pool. Pass [`common::top_k_quickselect`] for the standard
-    /// introselect-based selection instead of a full sort.
     pub fn search(
         &self,
         query: &[f32],
@@ -518,7 +511,6 @@ impl TimeBucketIndex {
             self.m_max0,
             self.ef_construction,
             NODE_BLOCK_CAPACITY,
-            self.closest_m_candidates,
             bucket_rng,
         ));
         let restored = index.load_blocks_from_dir(local_dir)?;
@@ -712,7 +704,6 @@ mod tests {
             8,
             32,
             Duration::from_secs(bucket_duration),
-            top_k_quickselect,
             StdRng::seed_from_u64(42),
         )
         .unwrap()
@@ -853,7 +844,6 @@ mod tests {
             8,
             32,
             Duration::from_secs(1),
-            top_k_quickselect,
             StdRng::seed_from_u64(42),
         )
         .unwrap();
@@ -1516,7 +1506,6 @@ mod tests {
             8,
             32,
             std::time::Duration::from_secs(1),
-            top_k_quickselect,
             rand::rngs::StdRng::seed_from_u64(1),
         )
         .unwrap();
@@ -1542,7 +1531,6 @@ mod tests {
             8,
             32,
             std::time::Duration::from_secs(1),
-            top_k_quickselect,
             rand::rngs::StdRng::seed_from_u64(0),
         )
         .unwrap();

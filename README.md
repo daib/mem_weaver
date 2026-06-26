@@ -101,6 +101,34 @@ M=16, M_MAX0=32, ef_search=100, k=10, 10,000 queries.
 
 **Why higher ef_construction gives better parallel speedup:** more work per insertion means a larger parallel fraction and smaller sequential fraction (Amdahl's law). ef=40: 1.77x speedup; ef=100: 2.65x speedup.
 
+### Search performance (Apple M-series, 6 performance cores)
+
+SIFT1M, ef_search=100, k=10, 10,000 queries.
+
+#### MemWeaver (ef_construction=100 + capacity-aware)
+
+| Threads | QPS | Speedup | p50 | p95 | p99 |
+|---------|-----|---------|-----|-----|-----|
+| 1 | 2,908 | 1.0x | 0.332ms | 0.436ms | 0.871ms |
+| 2 | 5,524 | 1.90x | 0.332ms | 0.414ms | 0.548ms |
+| 4 | 11,576 | 3.98x | 0.342ms | 0.415ms | 0.493ms |
+| 6 | 17,021 | 5.85x | 0.351ms | 0.425ms | 0.512ms |
+
+Search scales near-linearly — 97% efficiency at 6 threads. p50 latency is essentially unchanged across thread counts (0.332ms → 0.351ms).
+
+#### MemWeaver vs Qdrant (same hardware, same dataset)
+
+Both run on Apple M-series, SIFT1M, M=16, ef_construction=100, ef_search=100, k=10.
+
+| System | Build | QPS (6t) | p50 | p99 | Recall@10 |
+|--------|-------|----------|-----|-----|-----------|
+| MemWeaver | 103s | **17,021** | **0.351ms** | **0.512ms** | 0.979 |
+| Qdrant | 14s | 6,179 | 0.946ms | 1.512ms | 0.995 |
+
+MemWeaver is **2.75x higher throughput** and **3x lower latency** than Qdrant at 6 threads. Qdrant builds **7x faster** and achieves **higher recall** (0.995 vs 0.979) — Qdrant uses internal quantization which accelerates build time and improves recall via full-precision reranking. MemWeaver uses full float32 throughout; quantization support is on the roadmap.
+
+Qdrant's QPS plateaus after 4 concurrent tasks (6,035 → 6,179) due to server overhead. MemWeaver is a library with no server layer — parallel search scales directly with thread count.
+
 Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Upper-level beam search (ef=5 at layers 1+) replaces greedy descent, escaping local optima. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
 
 The min=0.300 across all configurations reflects two hard queries in sparse regions of SIFT1M — a fundamental HNSW characteristic at M=16, ef_search=100, not an implementation issue.
@@ -354,6 +382,7 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] Parallel index construction (two-phase batch insertion, 1.77-2.65x speedup on 6 cores)
 - [x] Capacity-aware neighbor selection (eliminates eviction cascades at high ef_construction)
 - [x] Upper-level beam search (ef=5 at layers 1+, eliminates local optima traps)
+- [ ] Vector quantization (uint8/4-bit — faster build, higher recall via reranking)
 - [ ] Memory controller — automatic eviction policy
 
 **Cold tier optimization:**
@@ -365,6 +394,7 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [ ] Stateless reader nodes for horizontal read scaling (S3-backed)
 
 **Benchmarks:**
+- [x] Search performance — 17,021 QPS at 6 threads, near-linear scaling
 - [ ] pgvector comparison benchmarks
 
 ---

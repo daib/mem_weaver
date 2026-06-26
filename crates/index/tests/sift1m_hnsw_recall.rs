@@ -14,7 +14,6 @@
 use common::benchmark::{try_load_sift_ctx, RecallStats};
 use common::distance::euclidean_distance_sq;
 use common::eval::{recall_at_k, validate_recall_score};
-use common::top_k_quickselect;
 use index::{HnswArena, HnswIndex, HnswNaive, DEFAULT_ALIGNMENT};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -30,7 +29,7 @@ const M: usize = 16;
 const M_MAX0: usize = 32;
 const RNG_SEED: u64 = 0x_4853_4E57_5F53_4954;
 const DEFAULT_SEARCH_EF: usize = 100;
-const DEFAULT_EF_CONSTRUCTION: usize = 40;
+const DEFAULT_EF_CONSTRUCTION: usize = 100;
 const DEFAULT_NUM_BASE_VECTORS: usize = 10_000;
 const DEFAULT_NUM_QUERIES: usize = 10;
 
@@ -217,7 +216,6 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 M,
                 M_MAX0,
                 ef_construction,
-                top_k_quickselect,
                 StdRng::seed_from_u64(RNG_SEED),
             )),
             0, // default single threaded implementation
@@ -230,7 +228,6 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 M_MAX0,
                 ef_construction,
                 n_base,
-                top_k_quickselect,
                 StdRng::seed_from_u64(RNG_SEED),
             )),
             0, // default single threaded implementation
@@ -243,7 +240,6 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 M_MAX0,
                 ef_construction,
                 n_base,
-                top_k_quickselect,
                 StdRng::seed_from_u64(RNG_SEED),
             )),
             1, // multi-threaded implementation but only one thread is used
@@ -256,7 +252,6 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 M_MAX0,
                 ef_construction,
                 n_base,
-                top_k_quickselect,
                 StdRng::seed_from_u64(RNG_SEED),
             )),
             4,
@@ -269,7 +264,6 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
                 M_MAX0,
                 ef_construction,
                 n_base,
-                top_k_quickselect,
                 StdRng::seed_from_u64(RNG_SEED),
             )),
             6,

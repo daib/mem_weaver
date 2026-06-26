@@ -26,6 +26,10 @@ struct InsertPlan {
     neighbors_per_level: Vec<Vec<(NodeId, f32)>>,
 }
 
+const DEGREE_RATIO_CAP: f32 = 0.8;
+const MIN_GREEDY_SEARCH_LEVEL: i32 = 3;
+const BEAM_SEARCH_EF: usize = 5;
+
 /// Return `true` if any already-committed batch vector is closer to one of
 /// `plan`'s level-0 neighbors than `plan`'s own recorded distance.
 fn has_closer_committed(plan: &InsertPlan, committed_l0: &[HashMap<NodeId, f32>]) -> bool {
@@ -42,6 +46,15 @@ fn has_closer_committed(plan: &InsertPlan, committed_l0: &[HashMap<NodeId, f32>]
         }
     }
     false
+}
+
+#[inline]
+fn degree_penalized_score(dist: f32, neighbors: &[NodeId]) -> f32 {
+    let degree = neighbors
+        .iter()
+        .rposition(|&nb| nb != INVALID_NODE_ID)
+        .map_or(0, |i| i + 1);
+    dist * (1.0 + (degree as f32 / neighbors.len() as f32) * DEGREE_RATIO_CAP)
 }
 
 // ── Public trait ──────────────────────────────────────────────────────────────
@@ -128,7 +141,6 @@ pub struct Hnsw<N: HnswNodeStore> {
     max_depth: i32,
     pub entry_point: Option<NodeId>,
     graph: N,
-    closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
     rng: StdRng,
     pub node_ids: Vec<NodeId>,
     pub vector_ids: Vec<u64>,
@@ -162,14 +174,7 @@ impl Hnsw<NaiveNodeStore> {
     /// `m`: target max degree on levels `> 0`. Level 0 allows up to `m_max0` (often `2 * m`).
     ///
     /// Graph uses heap [`NaiveNodeStore`] (naive vector + naive node storage).
-    pub fn new(
-        dim: usize,
-        m: usize,
-        m_max0: usize,
-        ef_construction: usize,
-        closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
-        rng: StdRng,
-    ) -> Self {
+    pub fn new(dim: usize, m: usize, m_max0: usize, ef_construction: usize, rng: StdRng) -> Self {
         assert!(dim > 0, "dim must be positive");
         assert!(m >= 2, "m must be at least 2");
         assert!(m_max0 >= m, "m_max0 must be >= m");
@@ -184,7 +189,6 @@ impl Hnsw<NaiveNodeStore> {
             max_depth: -1,
             entry_point: None,
             graph: NaiveNodeStore::new(m, m_max0),
-            closest_m_candidates,
             rng,
             node_ids: Vec::new(),
             vector_ids: Vec::new(),
@@ -313,7 +317,6 @@ impl Hnsw<ArenaNodeStore> {
         m_max0: usize,
         ef_construction: usize,
         node_block_capacity: usize,
-        closest_m_candidates: fn(&[(NodeId, f32)], usize) -> Vec<NodeId>,
         rng: StdRng,
     ) -> Self {
         assert!(dim > 0, "dim must be positive");
@@ -337,7 +340,6 @@ impl Hnsw<ArenaNodeStore> {
             max_depth: -1,
             entry_point: None,
             graph,
-            closest_m_candidates,
             rng,
             node_ids: Vec::new(),
             vector_ids: Vec::new(),
@@ -430,20 +432,23 @@ impl<N: HnswNodeStore> Hnsw<N> {
         let mut ep = self.entry_point.expect("non-empty");
         let mut lc = self.max_depth;
 
-        while lc > 3 {
+        while lc > MIN_GREEDY_SEARCH_LEVEL {
             ep = self.greedy_closest(query, ep, lc as usize);
             lc -= 1;
         }
 
         for l in (0..=lc).rev() {
-            let this_ef = if l == 0 { ef } else { 5 };
+            let this_ef = if l == 0 { ef } else { BEAM_SEARCH_EF };
             // perform beam search at higher levels to avoid local minima
             let mut cands = self.search_level(query, ep, this_ef, l as usize);
             if l > 0 {
                 ep = cands.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap().0;
             } else {
-                cands.sort_by(|a, b| a.1.total_cmp(&b.1));
-                cands.truncate(k);
+                if cands.len() > k {
+                    cands.select_nth_unstable_by(k, |a, b| a.1.total_cmp(&b.1));
+                    cands.truncate(k);
+                }
+                cands.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
                 return cands
                     .into_iter()
                     .map(|(node_id, dist)| {
@@ -858,25 +863,38 @@ impl<N: HnswNodeStore> Hnsw<N> {
         }
 
         // Beam search + neighbor selection at each level.
+        let mut node_buf: Vec<u8> = Vec::new();
         for l in (0..=level).rev() {
             let candidates = if (l as i32) <= self.max_depth {
                 self.search_level(vector, ep, self.ef_construction, l)
             } else {
                 Vec::new()
             };
-            // retain only the m closest candidates
             let cap = if l == 0 { self.m_max0 } else { self.m };
-            let selected_ids = (self.closest_m_candidates)(&candidates, cap);
-            let dist_map: HashMap<NodeId, f32> = candidates.into_iter().collect();
-            let selected: Vec<(NodeId, f32)> = selected_ids
-                .into_iter()
-                .map(|n| (n, dist_map.get(&n).copied().unwrap_or(f32::MAX)))
+
+            // Score each candidate by distance penalised by its current degree:
+            //   score = dist * (1 + degree / cap)
+            // Candidates that already carry many edges pay a higher effective
+            // distance, steering new connections toward less-loaded nodes.
+            let mut scored: Vec<(NodeId, f32)> = candidates
+                .iter()
+                .map(|&(n, dist)| {
+                    let neighbors = self.graph.neighbors_at(n, l, &mut node_buf);
+                    let score = degree_penalized_score(dist, neighbors);
+                    (n, score)
+                })
                 .collect();
-            // select the closest candidate as the new entry point for the next level
-            if let Some((&best, _)) = dist_map.iter().min_by(|a, b| a.1.partial_cmp(b.1).unwrap()) {
-                ep = best;
+
+            let selected_len = cap.min(scored.len());
+            if selected_len < scored.len() {
+                scored.select_nth_unstable_by(selected_len, |a, b| a.1.total_cmp(&b.1));
+                scored.truncate(selected_len);
             }
-            neighbors_per_level[l] = selected;
+
+            if let Some((best, _)) = scored.iter().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap()) {
+                ep = *best;
+            }
+            neighbors_per_level[l] = scored;
         }
 
         InsertPlan {
@@ -895,8 +913,6 @@ impl<N: HnswNodeStore> Hnsw<N> {
 
 #[cfg(test)]
 mod tests {
-    use common::top_k_quickselect;
-
     use super::super::{HnswArena, HnswNaive};
     use super::*;
     use rand::SeedableRng;
@@ -912,6 +928,57 @@ mod tests {
 
     fn make_committed(entries: &[(NodeId, f32)]) -> HashMap<NodeId, f32> {
         entries.iter().cloned().collect()
+    }
+
+    #[test]
+    fn degree_penalized_score_counts_valid_neighbors() {
+        let invalid = INVALID_NODE_ID;
+        let high_degree = [
+            NodeId(0),
+            NodeId(1),
+            NodeId(2),
+            NodeId(3),
+            NodeId(4),
+            NodeId(5),
+            NodeId(6),
+            NodeId(7),
+            NodeId(8),
+            NodeId(9),
+        ];
+        let low_degree = [
+            NodeId(0),
+            NodeId(1),
+            NodeId(2),
+            NodeId(3),
+            NodeId(4),
+            NodeId(5),
+            NodeId(6),
+            invalid,
+            invalid,
+            invalid,
+        ];
+
+        // 8 valid / cap 10 → ratio 0.8, clamped to 0.8 → 10 * 1.8 = 18
+        assert_eq!(
+            degree_penalized_score(10.0, &high_degree),
+            10.0 * (1.0 + 1.0 * DEGREE_RATIO_CAP)
+        );
+        // 2 valid / cap 10 → ratio 0.2 → 10 * 1.2 = 12
+        assert_eq!(
+            degree_penalized_score(10.0, &low_degree),
+            10.0 * (1.0 + 0.7 * DEGREE_RATIO_CAP)
+        );
+        // all invalid → degree 0 → no penalty
+        assert_eq!(
+            degree_penalized_score(
+                10.0,
+                &[
+                    invalid, invalid, invalid, invalid, invalid, invalid, invalid, invalid,
+                    invalid, invalid
+                ]
+            ),
+            10.0 * (1.0 + 0.0 * DEGREE_RATIO_CAP)
+        );
     }
 
     #[test]
@@ -962,7 +1029,7 @@ mod tests {
     fn hnsw_naive_recalls_bruteforce_small() {
         let dim = 8usize;
         let rng = StdRng::seed_from_u64(42);
-        let mut index: HnswNaive = HnswNaive::new(dim, 8, 16, 128, top_k_quickselect, rng);
+        let mut index: HnswNaive = HnswNaive::new(dim, 8, 16, 128, rng);
 
         let n = 200usize;
         for i in 0..n {
@@ -1002,7 +1069,7 @@ mod tests {
     #[test]
     fn hnsw_naive_first_insert_is_entry() {
         let rng = StdRng::seed_from_u64(1);
-        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, rng);
+        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, rng);
         let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice(), 0u64);
         assert_eq!(id, NodeId(0));
         assert_eq!(index.entry_point, Some(NodeId(0)));
@@ -1015,7 +1082,7 @@ mod tests {
     fn hnsw_arena_recalls_bruteforce_small() {
         let dim = 8usize;
         let rng = StdRng::seed_from_u64(42);
-        let mut index: HnswArena = HnswArena::new(dim, 8, 16, 128, 1024, top_k_quickselect, rng);
+        let mut index: HnswArena = HnswArena::new(dim, 8, 16, 128, 1024, rng);
 
         let n = 200usize;
         let mut inserted: Vec<NodeId> = Vec::with_capacity(n);
@@ -1057,7 +1124,7 @@ mod tests {
     #[test]
     fn hnsw_arena_first_insert_is_entry() {
         let rng = StdRng::seed_from_u64(1);
-        let mut index: HnswArena = HnswArena::new(4, 4, 8, 32, 32, top_k_quickselect, rng);
+        let mut index: HnswArena = HnswArena::new(4, 4, 8, 32, 32, rng);
         let id = index.insert(vec![1.0, 0.0, 0.0, 0.0].as_slice(), 0u64);
         assert_eq!(id, NodeId(0));
         assert_eq!(index.entry_point, Some(NodeId(0)));
@@ -1069,7 +1136,7 @@ mod tests {
     #[test]
     fn save_load_levels_roundtrip() {
         let rng = StdRng::seed_from_u64(7);
-        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, rng);
+        let mut index: HnswNaive = HnswNaive::new(4, 4, 8, 32, rng);
         for i in 0..20u32 {
             index.insert(&[i as f32, 0.0, 0.0, 0.0], i as u64);
         }
@@ -1077,8 +1144,7 @@ mod tests {
         let path = dir.join("levels_roundtrip_test.bin");
         index.save_levels(&path).unwrap();
 
-        let mut index2: HnswNaive =
-            HnswNaive::new(4, 4, 8, 32, top_k_quickselect, StdRng::seed_from_u64(0));
+        let mut index2: HnswNaive = HnswNaive::new(4, 4, 8, 32, StdRng::seed_from_u64(0));
         index2.load_levels(&path).unwrap();
         assert_eq!(index.node_ids, index2.node_ids);
         assert_eq!(index.levels, index2.levels);
@@ -1093,7 +1159,7 @@ mod tests {
         const N: usize = 10_000;
         const EF: usize = 200;
         let rng = StdRng::seed_from_u64(0x_4853_4E57_5F53_4954);
-        let mut index: HnswArena = HnswArena::new(DIM, M, M_MAX0, EF, N, top_k_quickselect, rng);
+        let mut index: HnswArena = HnswArena::new(DIM, M, M_MAX0, EF, N, rng);
         for i in 0..N {
             let v: Vec<f32> = (0..DIM)
                 .map(|j| ((i * DIM + j) as f32 * 0.03).sin())

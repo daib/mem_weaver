@@ -66,7 +66,7 @@ const DEFAULT_EF_CONSTRUCTION: usize = 40;
 const DEFAULT_SEARCH_EF: usize = 100;
 /// Default base-vector cap when `SIFT1M_LIMIT` / `SIFT1M_RECALL_N_BASE` do not override (full SIFT1M).
 const DEFAULT_SIFT_NUM_BASE: usize = 1_000_000;
-const DEFAULT_BENCH_SAMPLE_SIZE: usize = 10;
+const DEFAULT_BENCH_SAMPLE_SIZE: usize = 10_000;
 /// Criterion 0.5 `BenchmarkGroup::sample_size` requires this minimum (`assert!(n >= 10)`).
 const CRITERION_MIN_SAMPLE_SIZE: usize = 10;
 
@@ -284,7 +284,6 @@ fn execute_benchmark(c: &mut Criterion, ctx: &SiftCtx, index: &mut dyn HnswIndex
                 M_MAX0,
                 *ef_construction,
                 *n_base,
-                top_k_quickselect,
                 StdRng::seed_from_u64(RNG_SEED),
             );
             let insert_started = Instant::now();
@@ -356,7 +355,6 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                     M_MAX0,
                     ef_construction,
                     n_base,
-                    top_k_quickselect,
                     StdRng::seed_from_u64(RNG_SEED),
                 );
                 let insert_started = Instant::now();
@@ -375,7 +373,6 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                     M,
                     M_MAX0,
                     ef_construction,
-                    top_k_quickselect,
                     StdRng::seed_from_u64(RNG_SEED),
                 );
                 let insert_started = Instant::now();
@@ -420,7 +417,6 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                     M_MAX0,
                     ef_construction,
                     n_base,
-                    top_k_quickselect,
                     StdRng::seed_from_u64(RNG_SEED),
                 );
                 let insert_started = Instant::now();
@@ -438,7 +434,6 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
                     M,
                     M_MAX0,
                     ef_construction,
-                    top_k_quickselect,
                     StdRng::seed_from_u64(RNG_SEED),
                 );
                 let insert_started = Instant::now();
@@ -465,7 +460,6 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
             M_MAX0,
             ef_construction,
             n_base,
-            top_k_quickselect,
             StdRng::seed_from_u64(RNG_SEED),
         )),
         SmokeFlavor::Naive => Box::new(HnswNaive::new(
@@ -473,7 +467,6 @@ fn smoke_run_flavor(iterations: usize, setup: &BenchSetup, flavor: SmokeFlavor) 
             M,
             M_MAX0,
             ef_construction,
-            top_k_quickselect,
             StdRng::seed_from_u64(RNG_SEED),
         )),
     };
@@ -563,7 +556,6 @@ fn bench_hnsw_sift1m(c: &mut Criterion) {
         M_MAX0,
         ef_construction,
         ctx.n_base,
-        top_k_quickselect,
         StdRng::seed_from_u64(RNG_SEED),
     );
     execute_benchmark(c, ctx, &mut arena);
@@ -590,7 +582,6 @@ fn bench_hnsw_naive_sift1m(c: &mut Criterion) {
         M,
         M_MAX0,
         ef_construction,
-        top_k_quickselect,
         StdRng::seed_from_u64(RNG_SEED),
     );
     execute_benchmark(c, ctx, &mut naive);

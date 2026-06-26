@@ -639,13 +639,12 @@ mod tests {
     #[tokio::test]
     async fn upload_download_levels_roundtrip() {
         use crate::HnswNaive;
-        use common::top_k_quickselect;
         use rand::{rngs::StdRng, SeedableRng};
 
         let local = temp_dir("levels");
         let _g = DirGuard(local.clone());
 
-        let mut idx = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, StdRng::seed_from_u64(3));
+        let mut idx = HnswNaive::new(4, 4, 8, 32, StdRng::seed_from_u64(3));
         for i in 0..10 {
             idx.insert(&[i as f32, 0.0, 0.0, 0.0], i as u64);
         }
@@ -666,7 +665,7 @@ mod tests {
             .await
             .expect("download");
 
-        let mut idx2 = HnswNaive::new(4, 4, 8, 32, top_k_quickselect, StdRng::seed_from_u64(0));
+        let mut idx2 = HnswNaive::new(4, 4, 8, 32, StdRng::seed_from_u64(0));
         idx2.load_levels(&restored).expect("load_levels");
         assert_eq!(idx.node_ids, idx2.node_ids);
         assert_eq!(idx.levels, idx2.levels);
@@ -675,13 +674,12 @@ mod tests {
     #[tokio::test]
     async fn upload_after_swap_out_pushes_real_arena_files() {
         use crate::{HnswArena, HnswIndex};
-        use common::top_k_quickselect;
         use rand::{rngs::StdRng, SeedableRng};
 
         let local = temp_dir("hnsw_swap");
         let _g = DirGuard(local.clone());
 
-        let mut idx = HnswArena::new(4, 4, 8, 32, 32, top_k_quickselect, StdRng::seed_from_u64(7));
+        let mut idx = HnswArena::new(4, 4, 8, 32, 32, StdRng::seed_from_u64(7));
         for i in 0..16 {
             let v = [i as f32, 0.0, 0.0, 0.0];
             idx.insert(&v, i as u64);

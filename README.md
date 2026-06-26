@@ -103,31 +103,34 @@ M=16, M_MAX0=32, ef_search=100, k=10, 10,000 queries.
 
 ### Search performance (Apple M-series, 6 performance cores)
 
-SIFT1M, ef_search=100, k=10, 10,000 queries.
+SIFT1M, k=10, 10,000 queries, ef_construction=100 + capacity-aware.
 
-#### MemWeaver (ef_construction=100 + capacity-aware)
+#### MemWeaver scaling
 
-| Threads | QPS | Speedup | p50 | p95 | p99 |
-|---------|-----|---------|-----|-----|-----|
-| 1 | 2,908 | 1.0x | 0.332ms | 0.436ms | 0.871ms |
-| 2 | 5,524 | 1.90x | 0.332ms | 0.414ms | 0.548ms |
-| 4 | 11,576 | 3.98x | 0.342ms | 0.415ms | 0.493ms |
-| 6 | 17,021 | 5.85x | 0.351ms | 0.425ms | 0.512ms |
+| ef_search | Threads | QPS | p50 | p99 | Recall@10 | Min recall |
+|-----------|---------|-----|-----|-----|-----------|------------|
+| 100 | 1 | 2,908 | 0.332ms | 0.871ms | 0.979 | 0.400 |
+| 100 | 6 | 17,021 | 0.351ms | 0.512ms | 0.979 | 0.400 |
+| 200 | 1 | 1,761 | 0.572ms | 0.800ms | 0.994 | 0.600 |
+| 200 | 6 | 9,916 | 0.588ms | 0.813ms | 0.994 | 0.600 |
 
-Search scales near-linearly — 97% efficiency at 6 threads. p50 latency is essentially unchanged across thread counts (0.332ms → 0.351ms).
+Search scales near-linearly — 97% efficiency at 6 threads for ef=100, 5.6x at ef=200.
 
 #### MemWeaver vs Qdrant (same hardware, same dataset)
 
-Both run on Apple M-series, SIFT1M, M=16, ef_construction=100, ef_search=100, k=10.
+Both run on Apple M-series, SIFT1M, M=16, ef_construction=100, k=10.
 
-| System | Build | QPS (6t) | p50 | p99 | Recall@10 |
-|--------|-------|----------|-----|-----|-----------|
-| MemWeaver | 103s | **17,021** | **0.351ms** | **0.512ms** | 0.979 |
-| Qdrant | 14s | 6,179 | 0.946ms | 1.512ms | 0.995 |
+| System | ef_search | QPS (6t) | p50 | p99 | Recall@10 | Min recall |
+|--------|-----------|----------|-----|-----|-----------|------------|
+| MemWeaver | 100 | 17,021 | 0.351ms | 0.512ms | 0.979 | 0.400 |
+| **MemWeaver** | **200** | **9,916** | **0.588ms** | **0.813ms** | **0.994** | **0.600** |
+| Qdrant | 100 | 6,179 | 0.946ms | 1.512ms | 0.995 | 0.500 |
 
-MemWeaver is **2.75x higher throughput** and **3x lower latency** than Qdrant at 6 threads. Qdrant builds **7x faster** and achieves **higher recall** (0.995 vs 0.979) — Qdrant uses internal quantization which accelerates build time and improves recall via full-precision reranking. MemWeaver uses full float32 throughout; quantization support is on the roadmap.
+At equivalent recall (0.994 vs 0.995), MemWeaver is **1.6x higher throughput** and **1.6x lower latency** than Qdrant. MemWeaver min recall (0.600) is also better than Qdrant (0.500) at this operating point.
 
-Qdrant's QPS plateaus after 4 concurrent tasks (6,035 → 6,179) due to server overhead. MemWeaver is a library with no server layer — parallel search scales directly with thread count.
+Qdrant builds **7x faster** (14s vs 103s) using internal quantization. MemWeaver uses full float32 throughout; quantization is on the roadmap and expected to close the build time gap while maintaining the search throughput advantage.
+
+Qdrant's QPS plateaus after 4 concurrent tasks due to server overhead. MemWeaver is an embedded library — parallel search scales directly with thread count with no server layer.
 
 Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Upper-level beam search (ef=5 at layers 1+) replaces greedy descent, escaping local optima. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
 

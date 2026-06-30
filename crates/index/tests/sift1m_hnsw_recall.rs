@@ -12,7 +12,7 @@
 //! - `SIFT1M_PARALLEL_THREADS` — thread count for batch insertion (default `4`).
 
 use common::benchmark::{
-    brute_force_topk, compute_recall_stats, latency_percentile, try_load_sift_ctx,
+    compute_recall_stats, latency_percentile, load_or_compute_ground_truth, try_load_sift_ctx,
 };
 use common::eval::{recall_at_k, validate_recall_score};
 use index::{HnswArena, HnswIndex, HnswNaive, DEFAULT_ALIGNMENT};
@@ -32,7 +32,7 @@ const RNG_SEED: u64 = 0x_4853_4E57_5F53_4954;
 const DEFAULT_SEARCH_EF: usize = 100;
 const DEFAULT_EF_CONSTRUCTION: usize = 100;
 const DEFAULT_NUM_BASE_VECTORS: usize = 1000_000;
-const DEFAULT_NUM_QUERIES: usize = 10;
+const DEFAULT_NUM_QUERIES: usize = 10_000;
 
 const DEFAULT_QPS_NUM_QUERIES: usize = 10_000;
 
@@ -57,7 +57,7 @@ fn format_ranked(ranked: &[(u64, f32)]) -> String {
 fn run_case(
     label: &str,
     index: &dyn HnswIndex,
-    corpus: &[Vec<f32>],
+    ground_truth: &[Vec<VectorId>],
     q_data: &[u8],
     dim: usize,
     n_q: usize,
@@ -66,30 +66,21 @@ fn run_case(
 ) {
     assert_eq!(
         index.len(),
-        corpus.len(),
+        ground_truth.len().max(index.len()),
         "{label}: len mismatch after insert"
     );
 
     let mut recalls = Vec::with_capacity(n_q);
     for qi in 0..n_q {
-        // if qi != 8500 && qi != 9049 {
-        //     continue;
-        // }
         let q = read_fvecs_vector_at(q_data, dim, qi).expect("query fvecs");
-        let expected = brute_force_topk(&q, corpus, K);
         let output = index.search(&q, K, ef);
 
-        let gt_ids: Vec<VectorId> = expected.iter().map(|(id, _)| VectorId(*id)).collect();
         let retrieved: Vec<VectorId> = output.iter().map(|(id, _)| VectorId(*id)).collect();
-        let r = recall_at_k(&retrieved, &gt_ids).expect("valid recall@k");
+        let r = recall_at_k(&retrieved, &ground_truth[qi]).expect("valid recall@k");
         validate_recall_score(r).expect("in-range score");
         recalls.push(r);
 
-        eprintln!(
-            "{label} query {qi}: recall@{K}={r:.4}\n  expected: {}\n  output:   {}",
-            format_ranked(&expected),
-            format_ranked(&output),
-        );
+        eprintln!("{label} query {qi}: recall@{K}={r:.4}");
     }
     let stats = compute_recall_stats(&mut recalls);
 
@@ -168,6 +159,8 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
     let n_q = ctx.n_q;
     let ef = ctx.search_ef.max(K);
     let corpus = load_corpus(ctx.base_data(), dim, n_base);
+    let ground_truth =
+        load_or_compute_ground_truth(&ctx.base_dir, &corpus, ctx.q_data(), dim, n_q, K);
 
     let ef_construction = std::env::var("SIFT1M_HNSW_EF_CONSTRUCTION")
         .ok()
@@ -259,7 +252,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
         run_case(
             label,
             index.as_ref(),
-            &corpus,
+            &ground_truth,
             ctx.q_data(),
             dim,
             n_q,

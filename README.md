@@ -398,7 +398,7 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 
 **Benchmarks:**
 - [x] Search performance — 17,021 QPS at 6 threads, near-linear scaling
-- [ ] pgvector comparison benchmarks
+- [x] Qdrant comparison benchmarks
 
 ---
 

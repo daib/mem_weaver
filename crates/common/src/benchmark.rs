@@ -5,7 +5,7 @@ use crate::{
 };
 use memmap2::Mmap;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// SIFT base vectors are 128-D in standard Texmex SIFT1M.
@@ -41,6 +41,103 @@ pub fn brute_force_topk(query: &[f32], corpus: &[Vec<f32>], k: usize) -> Vec<(u6
     scored.sort_by(|a, b| a.1.total_cmp(&b.1));
     scored.truncate(k);
     scored
+}
+
+// ── Ground-truth cache ───────────────────────────────────────────────────────
+
+const GT_MAGIC: &[u8; 4] = b"MWGT";
+
+fn gt_cache_path(base_dir: &Path, n_base: usize, n_q: usize, k: usize) -> PathBuf {
+    base_dir.join(format!("gt_{n_base}base_{n_q}q_{k}k.bin"))
+}
+
+fn try_load_gt(path: &Path, n_base: usize, n_q: usize, k: usize) -> Option<Vec<Vec<VectorId>>> {
+    let data = std::fs::read(path).ok()?;
+    let header = 4 + 8 * 3; // magic + n_base + n_q + k
+    if data.len() < header || &data[..4] != GT_MAGIC {
+        return None;
+    }
+    let read_u64 = |off: usize| -> usize {
+        u64::from_le_bytes(data[off..off + 8].try_into().unwrap()) as usize
+    };
+    if read_u64(4) != n_base || read_u64(12) != n_q || read_u64(20) != k {
+        return None;
+    }
+    if data.len() != header + n_q * k * 8 {
+        return None;
+    }
+    let payload = &data[header..];
+    Some(
+        (0..n_q)
+            .map(|qi| {
+                (0..k)
+                    .map(|ki| {
+                        let off = (qi * k + ki) * 8;
+                        VectorId(u64::from_le_bytes(
+                            payload[off..off + 8].try_into().unwrap(),
+                        ))
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+fn save_gt(path: &Path, n_base: usize, n_q: usize, k: usize, gt: &[Vec<VectorId>]) {
+    let header = 4 + 8 * 3;
+    let mut buf = Vec::with_capacity(header + n_q * k * 8);
+    buf.extend_from_slice(GT_MAGIC);
+    for &v in &[n_base as u64, n_q as u64, k as u64] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    for row in gt {
+        for id in row {
+            buf.extend_from_slice(&id.0.to_le_bytes());
+        }
+    }
+    if let Err(e) = std::fs::write(path, &buf) {
+        eprintln!("ground_truth: failed to write cache {path:?}: {e}");
+    } else {
+        eprintln!("ground_truth: saved to {path:?}");
+    }
+}
+
+/// Returns top-`k` ground-truth IDs per query, loading from disk cache when available.
+///
+/// The cache file is stored next to the SIFT data as
+/// `gt_{n_base}base_{n_q}q_{k}k.bin` and is invalidated automatically when
+/// any of those parameters change.
+pub fn load_or_compute_ground_truth(
+    base_dir: &Path,
+    corpus: &[Vec<f32>],
+    q_data: &[u8],
+    dim: usize,
+    n_q: usize,
+    k: usize,
+) -> Vec<Vec<VectorId>> {
+    let n_base = corpus.len();
+    let path = gt_cache_path(base_dir, n_base, n_q, k);
+
+    if let Some(gt) = try_load_gt(&path, n_base, n_q, k) {
+        eprintln!("ground_truth: loaded {n_q}×{k} from cache {path:?}");
+        return gt;
+    }
+
+    eprintln!("ground_truth: computing {n_q} queries × top-{k} over {n_base} vectors …");
+    let t = Instant::now();
+    let gt: Vec<Vec<VectorId>> = (0..n_q)
+        .map(|qi| {
+            let q = read_fvecs_vector_at(q_data, dim, qi).expect("query fvecs");
+            brute_force_topk(&q, corpus, k)
+                .into_iter()
+                .map(|(id, _)| VectorId(id))
+                .collect()
+        })
+        .collect();
+    eprintln!("ground_truth: done in {:.1} ms", ms(t.elapsed()));
+
+    save_gt(&path, n_base, n_q, k, &gt);
+    gt
 }
 
 /// Nearest-rank percentile over a latency slice (sorts in place).
@@ -96,6 +193,7 @@ fn open_mmap(path: &PathBuf) -> std::io::Result<Mmap> {
 pub struct SiftCtx {
     base_mmap: Mmap,
     q_mmap: Mmap,
+    pub base_dir: PathBuf,
     pub dim: usize,
     pub n_base: usize,
     pub n_q: usize,
@@ -193,11 +291,53 @@ pub fn try_load_sift_ctx(
     Some(SiftCtx {
         base_mmap,
         q_mmap,
+        base_dir,
         dim,
         n_base,
         n_q,
         search_ef,
     })
+}
+
+/// Run recall evaluation using pre-computed ground truth.
+pub fn sift_recall_stats_with_gt(
+    label: &str,
+    ground_truth: &[Vec<VectorId>],
+    q_data: &[u8],
+    dim: usize,
+    n_q: usize,
+    ef: usize,
+    mut search: impl FnMut(&[f32]) -> Vec<VectorId>,
+) -> (RecallStats, Duration, QueryPhaseTimings) {
+    let wall = Instant::now();
+    let mut timings = QueryPhaseTimings::default();
+    let mut recalls: Vec<f32> = Vec::with_capacity(n_q);
+    for qi in 0..n_q {
+        let q = read_fvecs_vector_at(q_data, dim, qi).expect("query fvecs");
+
+        let t1 = Instant::now();
+        let retrieved = search(&q);
+        timings.hnsw_search += t1.elapsed();
+
+        let r = recall_at_k(&retrieved, &ground_truth[qi]).expect("valid recall@k");
+        validate_recall_score(r).expect("in-range score");
+        recalls.push(r);
+        eprintln!("{label} query {qi}: recall@{K} = {r:.4} (ef={ef})");
+    }
+    let stats = compute_recall_stats(&mut recalls);
+    let query_wall = wall.elapsed();
+    eprintln!(
+        "{label}: query phase wall {:.3} ms total | HNSW search {:.3} ms | {} queries | {:.3} ms/query avg (wall)",
+        ms(query_wall),
+        ms(timings.hnsw_search),
+        n_q,
+        ms(query_wall) / n_q.max(1) as f64,
+    );
+    eprintln!(
+        "{label}: recall@{K} min={:.4} mean={:.4} p95={:.4} ({} queries)",
+        stats.min, stats.mean, stats.p95, n_q
+    );
+    (stats, query_wall, timings)
 }
 
 pub fn sift_recall_stats(

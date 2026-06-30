@@ -22,7 +22,9 @@
 
 mod helpers;
 
-use common::benchmark::{sift_recall_stats, try_load_sift_ctx};
+use common::benchmark::{
+    load_or_compute_ground_truth, sift_recall_stats_with_gt, try_load_sift_ctx,
+};
 use common::{top_k_quickselect, Timestamp};
 use index::{
     blob::{upload_levels, upload_manifest},
@@ -117,6 +119,8 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         ms(t_corpus.elapsed())
     );
 
+    let ground_truth = load_or_compute_ground_truth(&ctx.base_dir, &corpus, q_data, dim, n_q, K);
+
     let ef_construction = std::env::var("SIFT1M_HNSW_EF_CONSTRUCTION")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -204,14 +208,21 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         // Helper to keep the three recall passes identical.
         let run_recall = |index: &TimeBucketIndex, phase: &str| {
             let phased_label = format!("{label} [{phase}]");
-            let (stats, _, _) =
-                sift_recall_stats(&phased_label, &corpus, q_data, dim, n_q, ef, |q| {
+            let (stats, _, _) = sift_recall_stats_with_gt(
+                &phased_label,
+                &ground_truth,
+                q_data,
+                dim,
+                n_q,
+                ef,
+                |q| {
                     index
                         .search(q, K, ef, |_, d| d, None, top_k_quickselect)
                         .into_iter()
                         .map(|(vid, _)| VectorId(vid))
                         .collect()
-                });
+                },
+            );
             stats
         };
 

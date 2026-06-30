@@ -64,7 +64,7 @@
 //! | `SIFT1M_QDRANT_QPS_COLLECTION` | `sift1m_qps_test` | Collection name. |
 
 use common::benchmark::{
-    brute_force_topk, compute_recall_stats, latency_percentile, try_load_sift_ctx,
+    compute_recall_stats, latency_percentile, load_or_compute_ground_truth, try_load_sift_ctx,
 };
 use common::eval::{recall_at_k, validate_recall_score};
 use qdrant_client::qdrant::PointStruct;
@@ -305,6 +305,8 @@ async fn sift1m_qdrant_recall_vs_bruteforce() {
     let corpus: Vec<Vec<f32>> = (0..setup.n_base)
         .map(|i| read_fvecs_vector_at(ctx.base_data(), dim, i).expect("base fvecs"))
         .collect();
+    let ground_truth =
+        load_or_compute_ground_truth(&ctx.base_dir, &corpus, ctx.q_data(), dim, n_q, K);
 
     eprintln!(
         "sift1m_qdrant recall: url={} collection={collection} dim={dim} n_base={} n_q={n_q} \
@@ -318,7 +320,6 @@ async fn sift1m_qdrant_recall_vs_bruteforce() {
     let mut recalls = Vec::with_capacity(n_q);
     for qi in 0..n_q {
         let q = read_fvecs_vector_at(ctx.q_data(), dim, qi).expect("query fvecs");
-        let expected = brute_force_topk(&q, &corpus, K);
         let result = client
             .search_points(
                 SearchPointsBuilder::new(&collection, q, K as u64).params(
@@ -329,9 +330,8 @@ async fn sift1m_qdrant_recall_vs_bruteforce() {
             )
             .await
             .expect("search");
-        let gt_ids: Vec<VectorId> = expected.iter().map(|(id, _)| VectorId(*id)).collect();
         let retrieved = scored_to_ids(&result.result);
-        let r = recall_at_k(&retrieved, &gt_ids).expect("valid recall@k");
+        let r = recall_at_k(&retrieved, &ground_truth[qi]).expect("valid recall@k");
         validate_recall_score(r).expect("in-range score");
         recalls.push(r);
         eprintln!("sift1m_qdrant recall query {qi}: recall@{K}={r:.4}");

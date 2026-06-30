@@ -141,7 +141,6 @@ impl Node {
     fn total_size(dim: usize, max_level: usize, m: usize, m_max0: usize) -> usize {
         Self::edges_byte_offset(dim)
             + Self::edge_count(max_level, m, m_max0) * size_of::<NodeId>()
-            + 1
     }
 
     #[inline]

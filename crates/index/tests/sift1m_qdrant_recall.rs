@@ -69,8 +69,8 @@ use common::benchmark::{
 use common::eval::{recall_at_k, validate_recall_score};
 use qdrant_client::qdrant::PointStruct;
 use qdrant_client::qdrant::{
-    CreateCollectionBuilder, Distance, HnswConfigDiffBuilder, ScoredPoint, SearchParamsBuilder,
-    SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
+    CollectionStatus, CreateCollectionBuilder, Distance, HnswConfigDiffBuilder, ScoredPoint,
+    SearchParamsBuilder, SearchPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
 };
 use qdrant_client::{Payload, Qdrant};
 use vector::{read_fvecs_vector_at, VectorId};
@@ -176,9 +176,9 @@ const K: usize = 10;
 const DEFAULT_M: u64 = 16;
 const DEFAULT_EF_CONSTRUCTION: u64 = 100;
 const DEFAULT_SEARCH_EF: usize = 100;
-const DEFAULT_NUM_BASE_VECTORS: usize = 10_000;
+const DEFAULT_NUM_BASE_VECTORS: usize = 1000_000;
 const DEFAULT_BATCH_SIZE: usize = 256;
-const DEFAULT_NUM_QUERIES: usize = 10;
+const DEFAULT_NUM_QUERIES: usize = 10_000;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
@@ -262,8 +262,48 @@ async fn build_collection(
         inserted += batch.len();
     }
     eprintln!(
-        "sift1m_qdrant [{collection}]: insert done in {:.3} ms",
+        "sift1m_qdrant [{collection}]: upsert calls done in {:.3} ms, waiting for indexing",
         ms(t_insert.elapsed())
+    );
+
+    wait_for_indexing(client, collection, n_base, Duration::from_secs(120)).await;
+
+    eprintln!(
+        "sift1m_qdrant [{collection}]: insert + indexing done in {:.3} ms",
+        ms(t_insert.elapsed())
+    );
+}
+
+/// Qdrant's upsert `wait(true)` only blocks until points are written, not until
+/// HNSW indexing of those points completes in the background. Poll collection
+/// status/indexed count so callers can measure true "ready to search" time.
+async fn wait_for_indexing(client: &Qdrant, collection: &str, n_points: usize, timeout: Duration) {
+    let t_wait = Instant::now();
+    loop {
+        let info = client
+            .collection_info(collection)
+            .await
+            .expect("collection info")
+            .result
+            .expect("collection info result");
+
+        let indexed = info.indexed_vectors_count.unwrap_or(0);
+        let status_ready = info.status == CollectionStatus::Green as i32;
+        if status_ready && indexed >= n_points as u64 {
+            break;
+        }
+        if t_wait.elapsed() > timeout {
+            panic!(
+                "sift1m_qdrant [{collection}]: indexing did not finish within {:?} \
+                 (status={:?} indexed={indexed}/{n_points})",
+                timeout, info.status,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "sift1m_qdrant [{collection}]: indexing settled after extra {:.3} ms",
+        ms(t_wait.elapsed())
     );
 }
 

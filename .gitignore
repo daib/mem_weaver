@@ -20,3 +20,5 @@ crates/grpc/data/*
 
 # Local logs
 *.log
+crates/index/.qdrant-initialized
+crates/index/storage/

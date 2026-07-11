@@ -118,19 +118,19 @@ Search scales near-linearly — 97% efficiency at 6 threads for ef=100, 5.6x at 
 
 #### MemWeaver vs Qdrant (same hardware, same dataset)
 
-Both run on Apple M-series, SIFT1M, M=16, ef_construction=100, k=10.
+Both run on Apple M-series, SIFT1M, M=16, ef_construction=100, k=10. Qdrant build time includes upsert (13.4s) + background indexing (19.2s) = 32.6s total.
 
-| System | ef_search | QPS (6t) | p50 | p99 | Recall@10 | Min recall |
-|--------|-----------|----------|-----|-----|-----------|------------|
-| MemWeaver | 100 | 17,021 | 0.351ms | 0.512ms | 0.979 | 0.400 |
-| **MemWeaver** | **200** | **9,916** | **0.588ms** | **0.813ms** | **0.994** | **0.600** |
-| Qdrant | 100 | 6,179 | 0.946ms | 1.512ms | 0.995 | 0.500 |
+| System | Build | ef_search | QPS (6t) | p50 | p99 | Recall@10 | Min recall |
+|--------|-------|-----------|----------|-----|-----|-----------|------------|
+| MemWeaver | 60s | 100 | ~10,400 | ~0.570ms | ~0.810ms | 0.988 | 0.400 |
+| **MemWeaver** | **103s** | **200** | **9,916** | **0.588ms** | **0.813ms** | **0.994** | **0.600** |
+| Qdrant | 32.6s | 100 | 6,158 | 0.951ms | 1.495ms | 0.995 | 0.500 |
 
 At equivalent recall (0.994 vs 0.995), MemWeaver is **1.6x higher throughput** and **1.6x lower latency** than Qdrant. MemWeaver min recall (0.600) is also better than Qdrant (0.500) at this operating point.
 
-Qdrant builds **7x faster** (14s vs 103s) using internal quantization. MemWeaver uses full float32 throughout; quantization is on the roadmap and expected to close the build time gap while maintaining the search throughput advantage.
+Qdrant builds **1.8x faster** (32.6s vs 60s). MemWeaver uses full float32 throughout; quantization with reranking is on the roadmap and expected to close the build time gap while maintaining the search throughput advantage.
 
-Qdrant's QPS plateaus after 4 concurrent tasks due to server overhead. MemWeaver is an embedded library — parallel search scales directly with thread count with no server layer.
+Qdrant's QPS plateaus after 4 concurrent tasks (5,866 → 6,158) due to server overhead. MemWeaver is an embedded library — parallel search scales directly with thread count with no server layer.
 
 Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Upper-level beam search (ef=5 at layers 1+) replaces greedy descent, escaping local optima. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
 

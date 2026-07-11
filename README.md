@@ -132,6 +132,21 @@ Qdrant builds **1.8x faster** (32.6s vs 60s). MemWeaver uses full float32 throug
 
 Qdrant's QPS plateaus after 4 concurrent tasks (5,866 → 6,158) due to server overhead. MemWeaver is an embedded library — parallel search scales directly with thread count with no server layer.
 
+#### Cold tier search performance (disk)
+
+After swap_out (308 arena blocks, 208ms), searching directly from Mac SSD, ef_construction=100, ef_search=100:
+
+| Threads | QPS | p50 | p99 | vs hot tier |
+|---------|-----|-----|-----|-------------|
+| 1 | 508 | 1.851ms | 2.810ms | 5.7x slower |
+| 2 | 748 | 2.421ms | 5.308ms | 7.8x slower |
+| 4 | **1,000** | **3.631ms** | **7.029ms** | **11.6x slower** |
+| 6 | 588* | 10.689ms | 14.119ms | 29x slower |
+
+*6 threads exceeds Mac SSD random read bandwidth — latency collapses. **4 threads is the optimal cold tier configuration.**
+
+Recall is identical to hot tier (0.979) — tiering is a pure performance/memory tradeoff with zero correctness cost. Production NVMe (~3GB/s vs Mac SSD ~1.5GB/s) is expected to improve cold tier QPS ~2x.
+
 Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Upper-level beam search (ef=5 at layers 1+) replaces greedy descent, escaping local optima. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
 
 The min=0.300 across all configurations reflects two hard queries in sparse regions of SIFT1M — a fundamental HNSW characteristic at M=16, ef_search=100, not an implementation issue.

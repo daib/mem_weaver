@@ -46,14 +46,6 @@ fn load_corpus(base_data: &[u8], dim: usize, n: usize) -> Vec<Vec<f32>> {
         .collect()
 }
 
-fn format_ranked(ranked: &[(u64, f32)]) -> String {
-    ranked
-        .iter()
-        .map(|(id, dist)| format!("{id}({dist:.4})"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn run_case(
     label: &str,
     index: &dyn HnswIndex,
@@ -260,6 +252,134 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
             0.75,
         );
         index.reset();
+    }
+}
+
+/// Unique temp dir for disk-swap QPS tests; caller responsible for cleanup.
+fn unique_swap_dir(tag: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mem_weaver_hnsw_qps_disk_{tag}_{pid}_{n}"))
+}
+
+/// Recursively deletes the directory on drop so the test stays self-cleaning on panic.
+struct DirGuard(std::path::PathBuf);
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Same sweep as [`sift1m_hnsw_qps_parallel`], but every arena block is swapped to disk
+/// (via [`HnswIndex::swap_out`]) before the queries run, so reads go through the
+/// `pread`-based on-disk path (`NodeBlockStorage::OnDisk`) instead of the anonymous mmap.
+/// Quantifies the QPS/latency cost of the on-disk read path relative to RAM.
+#[test]
+fn sift1m_hnsw_qps_disk() {
+    let _serial = TEST_MUTEX.lock().unwrap();
+
+    let n_q: usize = std::env::var("SIFT1M_HNSW_QPS_N_QUERIES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_QPS_NUM_QUERIES);
+
+    let Some(ctx) = try_load_sift_ctx(DEFAULT_NUM_BASE_VECTORS, n_q, DEFAULT_SEARCH_EF) else {
+        return;
+    };
+
+    let dim = ctx.dim;
+    let n_base = ctx.n_base;
+    let ef = ctx.search_ef.max(K);
+
+    let ef_construction = std::env::var("SIFT1M_HNSW_EF_CONSTRUCTION")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_EF_CONSTRUCTION);
+
+    eprintln!(
+        "sift1m_hnsw_qps_disk: dim={dim} n_base={n_base} n_q={n_q} n_threads=6 \
+         k={K} m={M} m_max0={M_MAX0} ef_search={ef} ef_construction={ef_construction} rng_seed={RNG_SEED}"
+    );
+
+    let corpus: Vec<Vec<f32>> = (0..n_base)
+        .map(|i| read_fvecs_vector_at(ctx.base_data(), dim, i).expect("base fvecs"))
+        .collect();
+
+    let mut index = HnswArena::new(
+        dim,
+        M,
+        M_MAX0,
+        ef_construction,
+        n_base,
+        StdRng::seed_from_u64(RNG_SEED),
+    );
+
+    let vector_ids: Vec<u64> = (0..n_base as u64).collect();
+    insert_parallel(
+        "sift1m_hnsw_qps_disk",
+        &mut index,
+        &corpus,
+        &vector_ids,
+        6,
+        10_000,
+    );
+
+    let dir = unique_swap_dir("qps");
+    let _guard = DirGuard(dir.clone());
+    let t_swap = Instant::now();
+    let moved = index.swap_out(&dir).expect("swap_out to disk");
+    eprintln!(
+        "sift1m_hnsw_qps_disk: swapped {moved} blocks to disk at {dir:?} in {:.3} ms",
+        ms(t_swap.elapsed())
+    );
+
+    let queries: Vec<Vec<f32>> = (0..n_q)
+        .map(|qi| read_fvecs_vector_at(ctx.q_data(), dim, qi % ctx.n_q).expect("query fvecs"))
+        .collect();
+
+    for n_threads in [1, 2, 4, 6] {
+        // Divide queries evenly across threads; each thread owns a contiguous slice.
+        let chunk_size = (n_q + n_threads - 1) / n_threads;
+
+        eprintln!("sift1m_hnsw_qps_disk: running {n_q} queries across {n_threads} threads");
+        let t_total = Instant::now();
+
+        let index_ref = &index;
+        let per_thread_latencies: Vec<Vec<f64>> = std::thread::scope(|s| {
+            queries
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut lats = Vec::with_capacity(chunk.len());
+                        for q in chunk {
+                            let t0 = Instant::now();
+                            std::hint::black_box(index_ref.search(q, K, ef));
+                            lats.push(ms(t0.elapsed()));
+                        }
+                        lats
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("thread panicked"))
+                .collect()
+        });
+
+        let elapsed = t_total.elapsed().as_secs_f64();
+        let qps = n_q as f64 / elapsed;
+
+        let mut latencies_ms: Vec<f64> = per_thread_latencies.into_iter().flatten().collect();
+        let p50 = latency_percentile(&mut latencies_ms, 50.0);
+        let p95 = latency_percentile(&mut latencies_ms, 95.0);
+        let p99 = latency_percentile(&mut latencies_ms, 99.0);
+
+        eprintln!(
+            "sift1m_hnsw_qps_disk: n_q={n_q} threads={n_threads} total={:.3}ms qps={qps:.1} \
+         p50={p50:.3}ms p95={p95:.3}ms p99={p99:.3}ms",
+            elapsed * 1e3,
+        );
     }
 }
 

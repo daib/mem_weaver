@@ -11,9 +11,9 @@
 //! - `SIFT1M_HNSW_EF` — search `ef` at level 0.
 //! - `SIFT1M_PARALLEL_THREADS` — thread count for batch insertion (default `4`).
 
-use common::benchmark::{
-    compute_recall_stats, latency_percentile, load_or_compute_ground_truth, try_load_sift_ctx,
-};
+mod helpers;
+
+use common::benchmark::{compute_recall_stats, load_or_compute_ground_truth, try_load_sift_ctx};
 use common::eval::{recall_at_k, validate_recall_score};
 use index::{HnswArena, HnswIndex, HnswNaive, DEFAULT_ALIGNMENT};
 use rand::rngs::StdRng;
@@ -31,8 +31,9 @@ const M_MAX0: usize = 32;
 const RNG_SEED: u64 = 0x_4853_4E57_5F53_4954;
 const DEFAULT_SEARCH_EF: usize = 100;
 const DEFAULT_EF_CONSTRUCTION: usize = 100;
-const DEFAULT_NUM_BASE_VECTORS: usize = 1000_000;
-const DEFAULT_NUM_QUERIES: usize = 10_000;
+const DEFAULT_NUM_BASE_VECTORS: usize = 10_000;
+const DEFAULT_NUM_QUERIES: usize = 10;
+const DEFAULT_PARALLEL_THREADS: usize = 6;
 
 const DEFAULT_QPS_NUM_QUERIES: usize = 10_000;
 
@@ -44,6 +45,15 @@ fn load_corpus(base_data: &[u8], dim: usize, n: usize) -> Vec<Vec<f32>> {
     (0..n)
         .map(|i| read_fvecs_vector_at(base_data, dim, i).expect("uniform fvecs"))
         .collect()
+}
+
+fn parallel_thread_counts() -> Vec<usize> {
+    std::env::var("SIFT1M_PARALLEL_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&threads| threads > 0)
+        .map(|threads| vec![threads])
+        .unwrap_or_else(|| vec![DEFAULT_PARALLEL_THREADS, 6])
 }
 
 fn run_case(
@@ -120,19 +130,9 @@ fn insert_parallel(
     num_threads: usize,
     chunk_size: usize,
 ) {
-    let n_base = corpus.len();
-    let t_idx = Instant::now();
-    let mut inserted = 0;
-
-    for (vec_chunk, id_chunk) in corpus.chunks(chunk_size).zip(vector_ids.chunks(chunk_size)) {
-        index.insert_batch_parallel(vec_chunk, id_chunk, num_threads);
-        inserted += vec_chunk.len();
-        eprintln!(
-            "{label}: inserted {inserted}/{n_base} vectors (cumulative {:.3} ms)",
-            ms(t_idx.elapsed()),
-        );
-    }
-    eprintln!("{label}: build total {:.3} ms", ms(t_idx.elapsed()));
+    helpers::sift::insert_in_batches(label, corpus.len(), chunk_size, |start, end| {
+        index.insert_batch_parallel(&corpus[start..end], &vector_ids[start..end], num_threads);
+    });
 }
 
 #[test]
@@ -158,15 +158,17 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_EF_CONSTRUCTION);
+    let parallel_thread_counts = parallel_thread_counts();
 
     eprintln!(
         "sift_hnsw_recall: dim={dim} n_base={n_base} n_q={n_q} k={K} m={M} m_max0={M_MAX0} \
-         ef_search={ef} ef_construction={ef_construction} alignment={DEFAULT_ALIGNMENT} rng_seed={RNG_SEED}"
+         ef_search={ef} ef_construction={ef_construction} parallel_threads={parallel_thread_counts:?} \
+         alignment={DEFAULT_ALIGNMENT} rng_seed={RNG_SEED}"
     );
 
-    let mut cases: Vec<(&str, Box<dyn HnswIndex>, usize)> = vec![
+    let mut cases: Vec<(String, Box<dyn HnswIndex>, usize)> = vec![
         (
-            "naive",
+            "naive".to_string(),
             Box::new(HnswNaive::new(
                 dim,
                 M,
@@ -177,7 +179,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
             0, // default single threaded implementation
         ),
         (
-            "arena",
+            "arena".to_string(),
             Box::new(HnswArena::new(
                 dim,
                 M,
@@ -189,7 +191,7 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
             0, // default single threaded implementation
         ),
         (
-            "arena/single",
+            "arena/single".to_string(),
             Box::new(HnswArena::new(
                 dim,
                 M,
@@ -200,31 +202,21 @@ fn sift1m_hnsw_recall_vs_bruteforce() {
             )),
             1, // multi-threaded implementation but only one thread is used
         ),
-        (
-            "arena/parallel-4",
-            Box::new(HnswArena::new(
-                dim,
-                M,
-                M_MAX0,
-                ef_construction,
-                n_base,
-                StdRng::seed_from_u64(RNG_SEED),
-            )),
-            4,
-        ),
-        (
-            "arena/parallel-6",
-            Box::new(HnswArena::new(
-                dim,
-                M,
-                M_MAX0,
-                ef_construction,
-                n_base,
-                StdRng::seed_from_u64(RNG_SEED),
-            )),
-            6,
-        ),
     ];
+    cases.extend(parallel_thread_counts.into_iter().map(|num_threads| {
+        (
+            format!("arena/parallel-{num_threads}"),
+            Box::new(HnswArena::new(
+                dim,
+                M,
+                M_MAX0,
+                ef_construction,
+                n_base,
+                StdRng::seed_from_u64(RNG_SEED),
+            )) as Box<dyn HnswIndex>,
+            num_threads,
+        )
+    }));
 
     for (label, index, num_threads) in &mut cases {
         if *num_threads == 0 {
@@ -339,48 +331,9 @@ fn sift1m_hnsw_qps_disk() {
         .map(|qi| read_fvecs_vector_at(ctx.q_data(), dim, qi % ctx.n_q).expect("query fvecs"))
         .collect();
 
-    for n_threads in [1, 2, 4, 6] {
-        // Divide queries evenly across threads; each thread owns a contiguous slice.
-        let chunk_size = (n_q + n_threads - 1) / n_threads;
-
-        eprintln!("sift1m_hnsw_qps_disk: running {n_q} queries across {n_threads} threads");
-        let t_total = Instant::now();
-
-        let index_ref = &index;
-        let per_thread_latencies: Vec<Vec<f64>> = std::thread::scope(|s| {
-            queries
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        let mut lats = Vec::with_capacity(chunk.len());
-                        for q in chunk {
-                            let t0 = Instant::now();
-                            std::hint::black_box(index_ref.search(q, K, ef));
-                            lats.push(ms(t0.elapsed()));
-                        }
-                        lats
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("thread panicked"))
-                .collect()
-        });
-
-        let elapsed = t_total.elapsed().as_secs_f64();
-        let qps = n_q as f64 / elapsed;
-
-        let mut latencies_ms: Vec<f64> = per_thread_latencies.into_iter().flatten().collect();
-        let p50 = latency_percentile(&mut latencies_ms, 50.0);
-        let p95 = latency_percentile(&mut latencies_ms, 95.0);
-        let p99 = latency_percentile(&mut latencies_ms, 99.0);
-
-        eprintln!(
-            "sift1m_hnsw_qps_disk: n_q={n_q} threads={n_threads} total={:.3}ms qps={qps:.1} \
-         p50={p50:.3}ms p95={p95:.3}ms p99={p99:.3}ms",
-            elapsed * 1e3,
-        );
-    }
+    helpers::sift::measure_qps("sift1m_hnsw_qps_disk", &queries, &[1, 2, 4, 6], |query| {
+        index.search(query, K, ef)
+    });
 }
 
 #[test]
@@ -437,46 +390,10 @@ fn sift1m_hnsw_qps_parallel() {
         .map(|qi| read_fvecs_vector_at(ctx.q_data(), dim, qi % ctx.n_q).expect("query fvecs"))
         .collect();
 
-    for n_threads in [1, 2, 4, 6] {
-        // Divide queries evenly across threads; each thread owns a contiguous slice.
-        let chunk_size = (n_q + n_threads - 1) / n_threads;
-
-        eprintln!("sift1m_hnsw_qps_parallel: running {n_q} queries across {n_threads} threads");
-        let t_total = Instant::now();
-
-        let index_ref = &index;
-        let per_thread_latencies: Vec<Vec<f64>> = std::thread::scope(|s| {
-            queries
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        let mut lats = Vec::with_capacity(chunk.len());
-                        for q in chunk {
-                            let t0 = Instant::now();
-                            std::hint::black_box(index_ref.search(q, K, ef));
-                            lats.push(ms(t0.elapsed()));
-                        }
-                        lats
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|h| h.join().expect("thread panicked"))
-                .collect()
-        });
-
-        let elapsed = t_total.elapsed().as_secs_f64();
-        let qps = n_q as f64 / elapsed;
-
-        let mut latencies_ms: Vec<f64> = per_thread_latencies.into_iter().flatten().collect();
-        let p50 = latency_percentile(&mut latencies_ms, 50.0);
-        let p95 = latency_percentile(&mut latencies_ms, 95.0);
-        let p99 = latency_percentile(&mut latencies_ms, 99.0);
-
-        eprintln!(
-            "sift1m_hnsw_qps_parallel: n_q={n_q} threads={n_threads} total={:.3}ms qps={qps:.1} \
-         p50={p50:.3}ms p95={p95:.3}ms p99={p99:.3}ms",
-            elapsed * 1e3,
-        );
-    }
+    helpers::sift::measure_qps(
+        "sift1m_hnsw_qps_parallel",
+        &queries,
+        &[1, 2, 4, 6],
+        |query| index.search(query, K, ef),
+    );
 }

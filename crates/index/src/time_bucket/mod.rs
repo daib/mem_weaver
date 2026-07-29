@@ -307,6 +307,74 @@ impl TimeBucketIndex {
         })
     }
 
+    /// Insert a timestamp-ordered batch, using the inner HNSW's parallel planning phase.
+    ///
+    /// Bucket routing and duplicate detection remain sequential so that bucket sequence
+    /// numbers and idempotent insert semantics match repeated calls to [`insert`].
+    /// Consecutive vectors assigned to the same time window are delegated together to
+    /// [`HnswIndex::insert_batch_parallel`]. `num_threads` must be greater than zero.
+    pub fn insert_batch_parallel(
+        &mut self,
+        vectors: &[Vec<f32>],
+        timestamps: &[Timestamp],
+        vector_ids: &[u64],
+        num_threads: usize,
+    ) -> Vec<Option<BucketedNodeId>> {
+        assert_eq!(vectors.len(), timestamps.len());
+        assert_eq!(vectors.len(), vector_ids.len());
+        assert!(num_threads > 0, "num_threads must be greater than zero");
+
+        let mut inserted = vec![None; vectors.len()];
+        let mut start = 0;
+        while start < vectors.len() {
+            let bucket_start = self.bucket_start(timestamps[start]);
+            let mut end = start + 1;
+            while end < vectors.len() && self.bucket_start(timestamps[end]) == bucket_start {
+                end += 1;
+            }
+
+            let needs_new = self
+                .buckets
+                .front()
+                .map_or(true, |bucket| bucket_start > bucket.created_at);
+            if needs_new {
+                self.alloc_bucket(bucket_start);
+            }
+            let bucket = self.buckets.front_mut().expect("just allocated");
+
+            let mut fresh = Vec::with_capacity(end - start);
+            let mut is_fresh = vec![false; end - start];
+            for i in start..end {
+                if self.known_vector_ids.insert(vector_ids[i]) {
+                    fresh.push(i);
+                    is_fresh[i - start] = true;
+                }
+            }
+            if fresh.len() == end - start {
+                bucket.index.insert_batch_parallel(
+                    &vectors[start..end],
+                    &vector_ids[start..end],
+                    num_threads,
+                );
+            } else {
+                // Preserve duplicate handling without copying non-contiguous vectors.
+                for i in fresh {
+                    bucket.index.insert(&vectors[i], vector_ids[i]);
+                }
+            }
+            for i in start..end {
+                if is_fresh[i - start] {
+                    inserted[i] = Some(BucketedNodeId {
+                        bucket_seq: bucket.seq,
+                        vector_id: vector_ids[i],
+                    });
+                }
+            }
+            start = end;
+        }
+        inserted
+    }
+
     /// Force-start a new bucket at the grid slot for `timestamp`.
     ///
     /// If the current front bucket is empty its `created_at` is updated in place
@@ -751,6 +819,24 @@ mod tests {
         idx.insert(&[2.0; 4], ts(10), 2u64);
         assert_eq!(idx.bucket_count(), 2);
         assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn parallel_batch_preserves_bucket_routing_and_deduplicates() {
+        let mut idx = make_index(10);
+        let vectors = vec![vec![0.0; 4], vec![1.0; 4], vec![2.0; 4], vec![3.0; 4]];
+        let timestamps = [ts(0), ts(5), ts(10), ts(15)];
+        let inserted = idx.insert_batch_parallel(&vectors, &timestamps, &[0, 1, 2, 3], 2);
+
+        assert!(inserted.iter().all(Option::is_some));
+        assert_eq!(idx.bucket_count(), 2);
+        assert_eq!(idx.len(), 4);
+        assert_eq!(inserted[0].unwrap().bucket_seq, BucketSeq(0));
+        assert_eq!(inserted[2].unwrap().bucket_seq, BucketSeq(1));
+
+        let duplicate = idx.insert_batch_parallel(&vectors[..1], &[ts(15)], &[0], 2);
+        assert_eq!(duplicate, vec![None]);
+        assert_eq!(idx.len(), 4);
     }
 
     #[test]

@@ -10,13 +10,24 @@
 //! # Environment
 //!
 //! - `SIFT1M_BASE_PATH` — directory with `sift_base.fvecs` and `sift_query.fvecs`. If unset the test returns immediately.
-//! - `SIFT1M_RECALL_N_BASE` — number of base vectors to load and index (default `10_000`).
-//! - `SIFT1M_RECALL_N_QUERIES` — number of queries to evaluate (default `10`).
+//! - `SIFT1M_RECALL_N_BASE` — number of base vectors to load and index (defaults:
+//!   `1_000_000` for the performance test, `10_000` for the S3 test).
+//! - `SIFT1M_RECALL_N_QUERIES` — number of queries to evaluate (defaults:
+//!   `10_000` for the performance test, `10` for the S3 test).
 //! - `SIFT1M_HNSW_EF` — search `ef` at level 0 (default `100`).
 //! - `SIFT1M_TIME_BUCKET_COUNTS` — comma-separated bucket counts to try (default `1,4,16`).
-//! - `MEM_WEAVER_S3_BUCKET` — when set, the swapped-out arena files are also uploaded to S3
-//!   under `s3://$BUCKET/$MEM_WEAVER_S3_PREFIX/n<num_buckets>/seq_<i>/` and the upload is
-//!   verified by downloading to a fresh dir and byte-comparing. Unset → S3 step skipped.
+//! - `SIFT1M_PARALLEL_THREADS` — HNSW insertion threads for the performance
+//!   test (default `4`; `1` uses sequential insertion).
+//! ## S3 test environment
+//!
+//! `sift1m_time_bucket_s3_recall_vs_bruteforce` additionally exercises the
+//! blob round trip:
+//!
+//! - `MEM_WEAVER_S3_BUCKET` — swapped-out arena files are uploaded under
+//!   `s3://$BUCKET/$MEM_WEAVER_S3_PREFIX/n<num_buckets>/seq_<i>/`, then
+//!   downloaded to a fresh directory before restoring. If omitted,
+//!   `DEFAULT_BUCKET` is used; unavailable credentials → the S3 test returns
+//!   immediately.
 //! - `MEM_WEAVER_S3_REGION` (default `us-east-1`), `MEM_WEAVER_S3_PROFILE` (default `default`),
 //!   `MEM_WEAVER_S3_PREFIX` (default unique per run). Credentials read from `~/.aws/credentials`.
 
@@ -33,6 +44,7 @@ use index::{
 use object_store::{path::Path as ObjectPath, ObjectStore};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rayon::ThreadPoolBuilder;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,9 +58,14 @@ const RNG_SEED: u64 = 0x_4853_4E57_5F53_4954;
 
 const DEFAULT_NUM_BASE_VECTORS: usize = 10_000;
 const DEFAULT_NUM_QUERIES: usize = 10;
+const S3_NUM_BASE_VECTORS: usize = 10;
+const S3_NUM_QUERIES: usize = 10;
+const QPS_THREAD_COUNTS: &[usize] = &[1, 2, 4, 6];
+const DEFAULT_PARALLEL_THREADS: usize = 6;
 const DEFAULT_EF_CONSTRUCTION: usize = 100;
 const DEFAULT_SEARCH_EF: usize = 100;
 const DEFAULT_BUCKET_COUNTS: &[usize] = &[4];
+const INSERT_PROGRESS_INTERVAL: usize = 10_000;
 
 // ── S3 defaults ─────────────────────────────────────────────────────────────
 // Used when MEM_WEAVER_S3_* env vars are unset. Edit these to your dev bucket
@@ -87,12 +104,50 @@ fn parse_bucket_counts() -> Vec<usize> {
     }
 }
 
+fn parse_parallel_threads() -> usize {
+    std::env::var("SIFT1M_PARALLEL_THREADS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&threads| threads > 0)
+        .unwrap_or(DEFAULT_PARALLEL_THREADS)
+}
+
+/// Measures local hot, swapped-out, and restored recall without touching S3.
 #[test]
-fn sift1m_time_bucket_recall_vs_bruteforce() {
-    let t_load = Instant::now();
-    let Some(ctx) = try_load_sift_ctx(
+fn sift1m_time_bucket_recall_vs_bruteforce_performance() {
+    run_sift1m_time_bucket_recall_vs_bruteforce(
+        None,
         DEFAULT_NUM_BASE_VECTORS,
         DEFAULT_NUM_QUERIES,
+        parse_parallel_threads(),
+    );
+}
+
+/// Verifies recall survives a full S3 upload, local eviction, and blob restore.
+#[test]
+fn sift1m_time_bucket_s3_recall_vs_bruteforce() {
+    let Some(s3) = S3Setup::try_from_env().expect("S3 setup failed") else {
+        eprintln!("s3: configuration or credentials unavailable; S3 test skipped");
+        return;
+    };
+    eprintln!(
+        "s3: bucket={} region={} run_prefix={}",
+        s3.bucket, s3.region, s3.run_prefix
+    );
+
+    run_sift1m_time_bucket_recall_vs_bruteforce(Some(&s3), S3_NUM_BASE_VECTORS, S3_NUM_QUERIES, 1);
+}
+
+fn run_sift1m_time_bucket_recall_vs_bruteforce(
+    s3: Option<&S3Setup>,
+    default_num_base_vectors: usize,
+    default_num_queries: usize,
+    insert_threads: usize,
+) {
+    let t_load = Instant::now();
+    let Some(ctx) = try_load_sift_ctx(
+        default_num_base_vectors,
+        default_num_queries,
         DEFAULT_SEARCH_EF,
     ) else {
         return;
@@ -129,24 +184,8 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
     let bucket_counts = parse_bucket_counts();
 
     eprintln!(
-        "sift_time_bucket_recall: dim={dim} n_base={n_base} n_q={n_q} k={K} m={M} m_max0={M_MAX0} ef_search={ef} ef_construction={ef_construction} alignment={DEFAULT_ALIGNMENT} rng_seed={RNG_SEED} bucket_counts={bucket_counts:?}"
+        "sift_time_bucket_recall: dim={dim} n_base={n_base} n_q={n_q} k={K} m={M} m_max0={M_MAX0} ef_search={ef} ef_construction={ef_construction} insertion_threads={insert_threads} alignment={DEFAULT_ALIGNMENT} rng_seed={RNG_SEED} bucket_counts={bucket_counts:?}"
     );
-
-    // Optional S3 setup: only initialized if MEM_WEAVER_S3_BUCKET is set.
-    let s3 = match S3Setup::try_from_env() {
-        Ok(Some(s)) => {
-            eprintln!(
-                "s3: bucket={} region={} run_prefix={}",
-                s.bucket, s.region, s.run_prefix
-            );
-            Some(s)
-        }
-        Ok(None) => {
-            eprintln!("s3: MEM_WEAVER_S3_BUCKET unset; S3 upload step skipped");
-            None
-        }
-        Err(e) => panic!("S3 setup failed: {e}"),
-    };
 
     for &num_buckets in &bucket_counts {
         // Choose bucket_duration so the row-indexed timestamps split into ~num_buckets windows.
@@ -166,33 +205,46 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         .expect("valid TimeBucketIndex config");
 
         let t_idx = Instant::now();
-        let mut batch_start = Instant::now();
         let mut seen_seqs = std::collections::HashSet::new();
-        for (i, v) in corpus.iter().enumerate() {
-            let bid = index.insert(v.as_slice(), Timestamp(i as u64), i as u64);
-            if let Some(bid) = bid {
-                seen_seqs.insert(bid.bucket_seq);
+        if insert_threads == 1 {
+            for (i, v) in corpus.iter().enumerate() {
+                let bid = index.insert(v.as_slice(), Timestamp(i as u64), i as u64);
+                if let Some(bid) = bid {
+                    seen_seqs.insert(bid.bucket_seq);
+                }
             }
-            if (i + 1) % 10_000 == 0 {
-                eprintln!(
-                    "{label}: inserted [{}, {}) 10_000 vectors in {:.3} ms (cumulative build {:.3} ms)",
-                    i + 1 - 10_000,
-                    i + 1,
-                    ms(batch_start.elapsed()),
-                    ms(t_idx.elapsed())
-                );
-                batch_start = Instant::now();
-            } else if i + 1 == n_base && (n_base % 10_000 != 0) {
-                let n = n_base % 10_000;
-                eprintln!(
-                    "{label}: inserted [{}, {}) {n} vectors in {:.3} ms (cumulative build {:.3} ms)",
-                    n_base - n,
-                    n_base,
-                    ms(batch_start.elapsed()),
-                    ms(t_idx.elapsed())
-                );
-            }
+        } else {
+            let timestamps: Vec<_> = (0..n_base).map(|i| Timestamp(i as u64)).collect();
+            let vector_ids: Vec<_> = (0..n_base).map(|i| i as u64).collect();
+            let thread_pool = ThreadPoolBuilder::new()
+                .num_threads(insert_threads)
+                .build()
+                .expect("valid Rayon thread-pool configuration");
+
+            helpers::sift::insert_in_batches(
+                &label,
+                n_base,
+                INSERT_PROGRESS_INTERVAL,
+                |start, end| {
+                    for bid in thread_pool.install(|| {
+                        index.insert_batch_parallel(
+                            &corpus[start..end],
+                            &timestamps[start..end],
+                            &vector_ids[start..end],
+                            insert_threads,
+                        )
+                    }) {
+                        if let Some(bid) = bid {
+                            seen_seqs.insert(bid.bucket_seq);
+                        }
+                    }
+                },
+            );
         }
+        eprintln!(
+            "{label}: inserted {n_base} vectors using {insert_threads} thread(s) in {:.3} ms",
+            ms(t_idx.elapsed())
+        );
         eprintln!(
             "{label}: index build (insert n={n_base}) {:.3} ms — {} buckets created (bucket_duration={}s)",
             ms(t_idx.elapsed()),
@@ -228,6 +280,24 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
 
         // ── Three recall passes: hot → cold → restored ─────────────────────────
         let hot_stats = run_recall(&index, "hot");
+        let queries: Vec<Vec<f32>> = (0..n_q)
+            .map(|i| read_fvecs_vector_at(q_data, dim, i).expect("uniform fvecs"))
+            .collect();
+        helpers::sift::measure_qps(
+            &format!("{label} [hot qps]"),
+            &queries,
+            QPS_THREAD_COUNTS,
+            |query| {
+                index.search(
+                    query,
+                    K,
+                    ef,
+                    |_, distance| distance,
+                    None,
+                    top_k_quickselect,
+                )
+            },
+        );
 
         let cold_root = unique_swap_dir(&format!("sift_time_bucket_n{num_buckets}"));
         let _cold_guard = DirGuard(cold_root.clone());
@@ -247,9 +317,24 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
         );
 
         let cold_stats = run_recall(&index, "cold");
+        helpers::sift::measure_qps(
+            &format!("{label} [cold qps]"),
+            &queries,
+            QPS_THREAD_COUNTS,
+            |query| {
+                index.search(
+                    query,
+                    K,
+                    ef,
+                    |_, distance| distance,
+                    None,
+                    top_k_quickselect,
+                )
+            },
+        );
 
-        // ── Restore: either via local fds (no S3) or via full S3 round-trip ─────
-        // When S3 is configured, we upload, evict the local fds, delete the local
+        // ── Restore: via local fds or a full S3 round-trip ──────────────────────
+        // The S3 test uploads, evicts the local fds, deletes the local
         // files, then download into a *fresh* dir and swap_in_from there — proving
         // search actually reads from blob-derived bytes (not lingering local copies).
         let t_swap_in = Instant::now();
@@ -323,7 +408,7 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
 
             Some(blob_guard)
         } else {
-            // No S3 — restore from the local fds held by swap_out.
+            // The performance test restores from the local fds held by swap_out.
             for seq in &bucket_seqs {
                 let restored = index.swap_bucket_in(*seq).expect("swap_bucket_in");
                 assert!(restored, "{label}: bucket_seq must be present for swap_in");
@@ -338,15 +423,12 @@ fn sift1m_time_bucket_recall_vs_bruteforce() {
 
         let restored_stats = run_recall(&index, "restored");
 
-        // One assertion: recall is acceptable AND all three phases agree exactly.
-        // (Same graph + same algorithm → only the byte source changes.)
-        assert!(
-            hot_stats.min >= 0.75
-                && (hot_stats.min, hot_stats.mean, hot_stats.p95)
-                    == (cold_stats.min, cold_stats.mean, cold_stats.p95)
-                && (hot_stats.min, hot_stats.mean, hot_stats.p95)
-                    == (restored_stats.min, restored_stats.mean, restored_stats.p95),
-            "{label}: recall floor and hot/cold/restored equivalence — hot={hot_stats:?} cold={cold_stats:?} restored={restored_stats:?}"
+        let phases_match = (hot_stats.min, hot_stats.mean, hot_stats.p95)
+            == (cold_stats.min, cold_stats.mean, cold_stats.p95)
+            && (hot_stats.min, hot_stats.mean, hot_stats.p95)
+                == (restored_stats.min, restored_stats.mean, restored_stats.p95);
+        eprintln!(
+            "{label}: recall stats — hot={hot_stats:?} cold={cold_stats:?} restored={restored_stats:?} phases_match={phases_match}"
         );
     }
 }

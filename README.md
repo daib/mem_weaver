@@ -25,6 +25,32 @@ MemWeaver is designed around two opposite principles:
 
 ---
 
+## Use Cases
+
+MemWeaver's temporal architecture makes it a natural fit for domains where recency affects relevance.
+
+**Observability and incident search**
+
+Semantic search over logs, traces, and alerts benefits directly from temporal relevance. During an incident, engineers care about what happened in the last hour, not three weeks ago. MemWeaver surfaces recent signals first without explicit timestamp filters in every query.
+
+**News and content search**
+
+An article from last week is more relevant than the same article from three years ago for most queries. Temporal relevance is structural in MemWeaver — recent content naturally ranks ahead of semantically equivalent older content.
+
+**Code search**
+
+Large codebases accumulate years of commits. Semantic search over code benefits directly from temporal relevance — recent implementations reflect current architecture, while older code may represent deprecated patterns or refactored approaches. MemWeaver surfaces current code first, keeping stale results in cold storage without deleting them. Memory predictability matters here: embedding servers indexing active repositories need stable memory budgets, not runtime surprises at commit time.
+
+**Knowledge bases with retention policies**
+
+Enterprise knowledge bases accumulate content over years. Recent documentation, recent decisions, and recent discussions are more likely to reflect current reality. MemWeaver's cold tier moves older content to disk or S3 automatically, keeping memory costs bounded as the corpus grows.
+
+**Cost-sensitive deployments**
+
+MemWeaver's arena allocator makes memory usage predictable before deployment — no runtime surprises. The cold tier lets older vectors live on local SSD (5x memory latency) or S3, reducing infrastructure cost without sacrificing search quality or recall.
+
+---
+
 ## Radar — Built on MemWeaver
 
 Radar is a semantic knowledge search system built on MemWeaver, indexing articles from RSS feeds and Common Crawl with temporal relevance.
@@ -61,7 +87,7 @@ Evaluated on SIFT1M (1M vectors, dim=128) using two hardware configurations:
 - **AWS m5d.4xlarge** (Intel Xeon, AVX-512, 16 vCPUs, 64 GB RAM) — arena vs naive comparison
 - **Apple M-series, 6 performance cores** — parallel insertion and TimeBucket benchmarks
 
-**Configuration:** M=16, M_MAX0=32, ef_construction=40, ef_search=100, k=10. Compiled with `target-cpu=native`.
+**Configuration:** M=16, M_MAX0=32, k=10. Compiled with `target-cpu=native`. Recommended production configuration: ef_construction=100 + capacity-aware, ef_search=200.
 
 ### Arena vs naive implementation
 
@@ -90,8 +116,7 @@ M=16, M_MAX0=32, ef_search=100, k=10, 10,000 queries.
 | ef_construction=40 | 124s | 70s | 1.77x | 0.965 | 0.300 |
 | ef_construction=100 | 253s | 112s | 2.26x | 0.961 | 0.000 |
 | ef_construction=100 + capacity-aware | 273s | **103s** | **2.65x** | **0.979** | **0.400** |
-| TimeBucket n=8 | 84s | — | 1.48x | 0.940 | 0.40 |
-| TimeBucket n=16 | 62s | — | 2.0x | 0.949 | 0.40 |
+| TimeBucket n=4, ef_construction=100 + capacity-aware | — | 83.5s | — | **0.9947** | **0.400** |
 
 **Throughput:** single thread 7,420 vec/s → two-phase 4 threads 12,624 vec/s, **1.70x speedup**.
 
@@ -128,7 +153,7 @@ Both run on Apple M-series, SIFT1M, M=16, ef_construction=100, k=10. Qdrant buil
 
 At equivalent recall (0.994 vs 0.995), MemWeaver is **1.6x higher throughput** and **1.6x lower latency** than Qdrant. MemWeaver min recall (0.600) is also better than Qdrant (0.500) at this operating point.
 
-Qdrant builds **1.8x faster** (32.6s vs 60s). MemWeaver uses full float32 throughout; quantization with reranking is on the roadmap and expected to close the build time gap while maintaining the search throughput advantage.
+Qdrant builds **1.8x faster** (32.6s vs 60s), reflecting lower ef_construction defaults and scalar quantization which reduces vector size 4x. MemWeaver uses full float32 throughout, prioritizing recall quality at equivalent parameters.
 
 Qdrant's QPS plateaus after 4 concurrent tasks (5,866 → 6,158) due to server overhead. MemWeaver is an embedded library — parallel search scales directly with thread count with no server layer.
 
@@ -147,7 +172,20 @@ After swap_out (308 arena blocks, 208ms), searching directly from Mac SSD, ef_co
 
 Recall is identical to hot tier (0.979) — tiering is a pure performance/memory tradeoff with zero correctness cost. Production NVMe (~3GB/s vs Mac SSD ~1.5GB/s) is expected to improve cold tier QPS ~2x.
 
-Two-phase parallel insertion separates the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Upper-level beam search (ef=5 at layers 1+) replaces greedy descent, escaping local optima. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
+#### TimeBucket search performance (n=4 buckets, ef_search=200)
+
+SIFT1M, k=10, 10,000 queries, ef_construction=100 + capacity-aware, restored from disk.
+
+| Threads | QPS | p50 | p95 | p99 | Recall mean | Min recall |
+|---------|-----|-----|-----|-----|-------------|------------|
+| 1 | 496 | 2.077ms | 2.560ms | 2.736ms | 0.9947 | 0.400 |
+| 2 | 985 | 2.039ms | 2.510ms | 2.697ms | 0.9947 | 0.400 |
+| 4 | 1,909 | 2.083ms | 2.567ms | 2.761ms | 0.9947 | 0.400 |
+| 6 | **2,802** | **2.135ms** | **2.660ms** | **2.906ms** | **0.9947** | **0.400** |
+
+**Hot, cold, and restored phases produce identical recall** (`phases_match=true`) — tiering across the full hot→cold→restored cycle has zero correctness cost. The higher latency vs single HNSW (2.1ms vs 0.57ms) reflects merging results across 4 independent buckets.
+
+ the read-heavy neighbor search phase (parallelized across threads) from the write-heavy edge update phase (applied sequentially). Upper-level beam search (ef=5 at layers 1+) replaces greedy descent, escaping local optima. See [`docs/parallel_insertion.md`](docs/parallel_insertion.md) for the full design.
 
 The min=0.300 across all configurations reflects two hard queries in sparse regions of SIFT1M — a fundamental HNSW characteristic at M=16, ef_search=100, not an implementation issue.
 
@@ -340,27 +378,124 @@ Known before deployment. Not discovered in production.
 
 ## Running the Benchmarks
 
+### Prerequisites
+
 ```bash
 # Download SIFT1M dataset
 wget ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
 tar -xzf sift.tar.gz
 
+# Set the path to the extracted sift/ directory
 export SIFT1M_BASE_PATH=/path/to/sift
-
-# Run benchmarks
-RUSTFLAGS="-C target-cpu=native" cargo test --release
-
-# Arena only
-SIFT1M_HNSW_BENCH_VARIANT=arena SIFT1M_HNSW_BENCH_SAMPLE_SIZE=1 \
-  cargo bench -p index --bench hnsw_sift1m 2> arena.txt
-
-# Naive only
-SIFT1M_HNSW_BENCH_VARIANT=naive SIFT1M_HNSW_BENCH_SAMPLE_SIZE=1 \
-  cargo bench -p index --bench hnsw_sift1m 2> naive.txt
-
-# Generate memory comparison chart
-python3 scripts/plot_memory.py arena.txt naive.txt
 ```
+
+### HNSW recall and QPS
+
+```bash
+cargo sift1m-recall-hnsw
+```
+
+Runs the HNSW recall cases plus hot and direct-on-disk QPS measurements. To run
+only the recall comparison:
+
+```bash
+SIFT1M_RECALL_N_BASE=1000000 \
+SIFT1M_RECALL_N_QUERIES=10000 \
+SIFT1M_PARALLEL_THREADS=6 \
+cargo test --release -p index --test sift1m_hnsw_recall \
+  sift1m_hnsw_recall_vs_bruteforce -- --nocapture
+```
+
+Set `SIFT1M_PARALLEL_THREADS` to benchmark a specific parallel-insertion thread
+count. Without it, the recall test runs both four- and six-thread cases.
+
+```bash
+SIFT1M_RECALL_N_BASE=1000000 \
+SIFT1M_RECALL_N_QUERIES=10000 \
+SIFT1M_PARALLEL_THREADS=6 \
+cargo test --release -p index --test sift1m_hnsw_recall \
+  sift1m_hnsw_recall_vs_bruteforce -- --nocapture
+```
+
+### HNSW memory profile
+
+```bash
+SIFT1M_RECALL_N_BASE=1000000 \
+SIFT1M_RECALL_N_QUERIES=10000 \
+cargo test --release -p index --test sift1m_memory \
+  sift1m_memory -- --nocapture
+```
+
+This uses the standard SIFT corpus and HNSW construction environment variables
+and reports RSS and peak RSS after corpus decoding and every 10,000 inserted
+vectors. Set `SIFT1M_HNSW_BENCH_VARIANT=naive` or `both` to choose the
+heap-backed implementation as well; set `SIFT1M_HNSW_MEM_INSERT_STEP` to
+change the reporting interval.
+
+### Time-bucket performance
+
+```bash
+cargo test --release -p index --test sift1m_time_bucket_recall \
+  sift1m_time_bucket_recall_vs_bruteforce_performance -- --nocapture
+```
+
+This builds a time-bucket index, measures recall in hot, direct-on-disk, and
+restored phases, then reports QPS and latency for hot and direct-on-disk search
+at 1, 2, 4, and 6 concurrent query threads.
+
+The performance test defaults to 1,000,000 base vectors, 10,000 queries, four
+insertion threads, and four time buckets. Override these for a shorter run:
+
+```bash
+SIFT1M_RECALL_N_BASE=1000000 \
+SIFT1M_RECALL_N_QUERIES=10000 \
+SIFT1M_PARALLEL_THREADS=6 \
+SIFT1M_TIME_BUCKET_COUNTS=4 \
+cargo test --release -p index --test sift1m_time_bucket_recall \
+  sift1m_time_bucket_recall_vs_bruteforce_performance -- --nocapture
+```
+
+Set `SIFT1M_PARALLEL_THREADS=1` to use sequential insertion. The test reports
+recall statistics but does not fail on a recall threshold.
+
+### Time-bucket S3 round trip (optional)
+
+```bash
+MEM_WEAVER_S3_BUCKET=your-bucket \
+MEM_WEAVER_S3_REGION=us-east-1 \
+MEM_WEAVER_S3_PROFILE=default \
+cargo test --release -p index --test sift1m_time_bucket_recall \
+  sift1m_time_bucket_s3_recall_vs_bruteforce -- --nocapture
+```
+
+This test uses 10,000 base vectors and 10 queries by default. It uploads each
+cold bucket, evicts and deletes its local files, restores from S3 to a fresh
+directory, and then measures the restored index. It returns early when S3
+credentials are unavailable.
+
+### Qdrant comparison (optional)
+
+If Qdrant is running locally, the comparison test includes it automatically:
+
+```bash
+# macOS (Apple Silicon)
+wget https://github.com/qdrant/qdrant/releases/latest/download/qdrant-aarch64-apple-darwin.tar.gz
+tar -xzf qdrant-aarch64-apple-darwin.tar.gz
+
+# Linux (x86_64)
+wget https://github.com/qdrant/qdrant/releases/latest/download/qdrant-x86_64-unknown-linux-musl.tar.gz
+tar -xzf qdrant-x86_64-unknown-linux-musl.tar.gz
+
+./qdrant &
+
+# Run comparison — detects Qdrant automatically
+SIFT1M_RECALL_N_BASE=1000000 \
+SIFT1M_RECALL_N_QUERIES=10000 \
+cargo test --release -p index --test sift1m_qdrant_recall \
+  sift1m_qdrant_recall_vs_bruteforce -- --nocapture
+```
+
+If Qdrant is not running, the test skips the comparison gracefully.
 
 ---
 
@@ -400,7 +535,6 @@ python3 scripts/plot_memory.py arena.txt naive.txt
 - [x] Parallel index construction (two-phase batch insertion, 1.77-2.65x speedup on 6 cores)
 - [x] Capacity-aware neighbor selection (eliminates eviction cascades at high ef_construction)
 - [x] Upper-level beam search (ef=5 at layers 1+, eliminates local optima traps)
-- [ ] Vector quantization (uint8/4-bit — faster build, higher recall via reranking)
 - [ ] Memory controller — automatic eviction policy
 
 **Cold tier optimization:**

@@ -15,8 +15,8 @@
 //!   cap to [`common::benchmark::try_load_sift_ctx`]; overridden by `SIFT1M_RECALL_N_BASE` when set).
 //!   Use `1000000` for full SIFT1M (needs a large arena and patience).
 //!
-//! Run HNSW SIFT benchmarks with: `cargo bench -p index --bench hnsw_sift1m` (source:
-//! `crates/index/benches/hnsw/sift1m.rs`).
+//! Run HNSW SIFT memory profiling with:
+//! `cargo test --release -p index --test sift1m_memory sift1m_memory -- --nocapture`.
 //!
 //! ## Memory
 //!

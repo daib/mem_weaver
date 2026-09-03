@@ -3,7 +3,7 @@ pub use common::types::NodeId;
 use common::DEFAULT_ARENA_CAPACITY;
 use crc32fast::Hasher as Crc32Hasher;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use vector::Arena;
@@ -108,6 +108,73 @@ fn read_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// Positional `write_all` on a `&File` (no cursor mutation, no truncation). Wraps the
+/// platform-specific `FileExt::write_all_at` on Unix and `seek_write`-style emulation
+/// elsewhere. Writing past the current end of file extends it (sparse on filesystems that
+/// support holes), which is how multiple blocks are packed into one chunk file: each
+/// block's slot is written independently, in any order, without truncating the others.
+#[inline]
+fn write_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut remaining = buf;
+        let mut off = offset;
+        while !remaining.is_empty() {
+            let n = file.seek_write(remaining, off)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write_at wrote 0 bytes",
+                ));
+            }
+            remaining = &remaining[n..];
+            off += n as u64;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, buf, offset);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional write not supported on this platform",
+        ))
+    }
+}
+
+/// Max [`NodeBlock`]s packed into one on-disk chunk file. Bounds how large a single file
+/// can grow (`BLOCKS_PER_FILE * (DEFAULT_ARENA_CAPACITY + page-rounding + 4)` bytes, ~64MB
+/// at the default 2MB arena capacity) while still cutting the per-file open/read/close
+/// syscall overhead that dominates cold-restore time when every block is its own file.
+const BLOCKS_PER_FILE: usize = 32;
+
+/// Fixed byte stride between consecutive blocks' slots within a chunk file: the page-
+/// rounded arena capacity plus the trailing CRC32. Every block uses `DEFAULT_ARENA_CAPACITY`,
+/// so every slot is the same size and slots can be addressed by `block_index % BLOCKS_PER_FILE`
+/// without a manifest.
+#[inline]
+fn chunk_block_stride() -> u64 {
+    (Arena::mapped_bytes_for(DEFAULT_ARENA_CAPACITY) + 4) as u64
+}
+
+/// Path of the chunk file that stores `block_index`'s slot.
+#[inline]
+fn chunk_file_path(dir: &Path, block_index: usize) -> PathBuf {
+    dir.join(format!("chunk_{}.arena", block_index / BLOCKS_PER_FILE))
+}
+
+/// Byte offset of `block_index`'s slot within its chunk file.
+#[inline]
+fn chunk_block_offset(block_index: usize, stride: u64) -> u64 {
+    (block_index % BLOCKS_PER_FILE) as u64 * stride
+}
+
 // the layout of the node is:
 // - vector: f32[dim]
 // - edges: NodeId[edge_count]
@@ -207,7 +274,13 @@ impl Node {
 
 enum NodeBlockStorage {
     InMemory(Arena),
-    OnDisk(File),
+    /// On disk at `offset` within `file`. `offset` is `0` for a block that owns its whole
+    /// file (the historical layout: [`NodeBlock::swap_out`], [`NodeBlock::copy_to`]); a
+    /// nonzero offset means the block is one of up to [`BLOCKS_PER_FILE`] slots packed
+    /// into a shared chunk file (produced by [`ArenaNodeStore::swap_out`]). Both are read
+    /// the same way — `vector_at`/`neighbors_at` just add `offset` to the node's
+    /// within-block byte offset.
+    OnDisk { file: File, offset: u64 },
     /// No local copy: the bytes were evicted via [`NodeBlock::evict`] and live only in
     /// remote storage (e.g. uploaded to S3). Reads (`vector_at`, `neighbors_at`) will
     /// panic until [`NodeBlock::swap_in_from`] restores the block from a path.
@@ -221,7 +294,7 @@ impl NodeBlockStorage {
     fn as_ptr(&self) -> *const u8 {
         match self {
             NodeBlockStorage::InMemory(a) => a.as_ptr(),
-            NodeBlockStorage::OnDisk(_) | NodeBlockStorage::Evicted => std::ptr::null(),
+            NodeBlockStorage::OnDisk { .. } | NodeBlockStorage::Evicted => std::ptr::null(),
         }
     }
 }
@@ -269,7 +342,7 @@ impl NodeBlock {
     /// [`NodeBlock::swap_in`] restores it.
     #[inline]
     pub fn is_on_disk(&self) -> bool {
-        matches!(self.storage, NodeBlockStorage::OnDisk(_))
+        matches!(self.storage, NodeBlockStorage::OnDisk { .. })
     }
 
     /// `true` when the block has been [`NodeBlock::evict`]ed — no local arena, no
@@ -305,7 +378,7 @@ impl NodeBlock {
         // are sealed.
         let arena = match &mut self.storage {
             NodeBlockStorage::InMemory(a) => a,
-            NodeBlockStorage::OnDisk(_) | NodeBlockStorage::Evicted => return None,
+            NodeBlockStorage::OnDisk { .. } | NodeBlockStorage::Evicted => return None,
         };
         // we need to align by 8 bytes at the moment
         let node_storage = arena.try_alloc_slice_aligned::<u8>(total, DEFAULT_ALIGNMENT)?;
@@ -343,11 +416,11 @@ impl NodeBlock {
                 // at the node base.
                 unsafe { std::slice::from_raw_parts(node_address.cast::<f32>(), self.dim) }
             }
-            NodeBlockStorage::OnDisk(file) => {
+            NodeBlockStorage::OnDisk { file, offset } => {
                 let bytes = self.dim * size_of::<f32>();
                 buf.resize(bytes, 0);
-                let offset = NodeBlock::derive_node_offset(node_id) as u64;
-                read_at(file, buf.as_mut_slice(), offset)
+                let abs_offset = offset + NodeBlock::derive_node_offset(node_id) as u64;
+                read_at(file, buf.as_mut_slice(), abs_offset)
                     .expect("read vector from on-disk node block");
                 // SAFETY: `Vec<u8>` returns at least `align_of::<usize>()`-aligned memory
                 // on every supported allocator (which is ≥ align_of::<f32>() = 4). Debug
@@ -373,12 +446,12 @@ impl NodeBlock {
                 let node_address = self.calculate_node_address(node_id);
                 unsafe { Node::edges_at_level(node_address, self.dim, level, self.m, self.m_max0) }
             }
-            NodeBlockStorage::OnDisk(file) => {
+            NodeBlockStorage::OnDisk { file, offset } => {
                 let cap = if level == 0 { self.m_max0 } else { self.m };
                 let edge_bytes = cap * size_of::<NodeId>();
                 buf.resize(edge_bytes, 0);
-                // Absolute byte offset within the file: <node base> + <edges header> +
-                // <level offset within edge slab>.
+                // Absolute byte offset within the file: <block offset> + <node base> +
+                // <edges header> + <level offset within edge slab>.
                 let edges_within_node = Node::edges_byte_offset(self.dim)
                     + if level == 0 {
                         0
@@ -386,7 +459,7 @@ impl NodeBlock {
                         (self.m_max0 + (level - 1) * self.m) * size_of::<NodeId>()
                     };
                 let abs_offset =
-                    (NodeBlock::derive_node_offset(node_id) + edges_within_node) as u64;
+                    offset + (NodeBlock::derive_node_offset(node_id) + edges_within_node) as u64;
                 read_at(file, buf.as_mut_slice(), abs_offset)
                     .expect("read edges from on-disk node block");
                 // SAFETY: buf is `cap * size_of::<NodeId>()` bytes; NodeId is repr(transparent)
@@ -421,6 +494,25 @@ impl NodeBlock {
         file.flush()
     }
 
+    /// Like [`NodeBlock::copy_to`] but writes into a caller-supplied, already-open chunk
+    /// file at a caller-computed byte `offset` instead of truncating a whole file for this
+    /// block alone, without changing storage state. No-op for on-disk or evicted blocks.
+    /// [`ArenaNodeStore::snapshot_to_dir`] uses this so its output is byte-identical to
+    /// [`ArenaNodeStore::swap_out`]'s chunked layout.
+    fn copy_to_at(&self, chunk_file: &File, offset: u64) -> io::Result<()> {
+        let NodeBlockStorage::InMemory(arena) = &self.storage else {
+            return Ok(());
+        };
+        let mapped = arena.mapped_bytes();
+        // SAFETY: `arena.as_ptr()` is valid for `mapped` bytes (the anonymous mmap).
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arena.as_ptr(), mapped) };
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(bytes);
+        let checksum = hasher.finalize();
+        write_at(chunk_file, bytes, offset)?;
+        write_at(chunk_file, &checksum.to_le_bytes(), offset + mapped as u64)
+    }
+
     /// Write the block's in-memory arena bytes to `path` (truncating any existing file),
     /// release the mapping, and transition to [`NodeBlockStorage::OnDisk`]. Errors if the
     /// block is already on disk.
@@ -435,7 +527,6 @@ impl NodeBlock {
                 hasher.update(bytes);
                 let checksum = hasher.finalize();
                 let mut file = OpenOptions::new()
-                    .read(true)
                     .write(true)
                     .create(true)
                     .truncate(true)
@@ -443,9 +534,16 @@ impl NodeBlock {
                 file.write_all(bytes)?;
                 file.write_all(&checksum.to_le_bytes())?;
                 file.flush()?;
-                file
+                // Force the dirty pages to disk now, synchronously, while we're already
+                // paying a blocking cost in swap_out. Dirty pages are tracked per-inode,
+                // not per-fd: closing *any* handle to a file with unflushed writes can
+                // trigger writeback, so merely reopening a fresh read-only fd (without an
+                // explicit sync_all here) does not move the cost off the swap_in path.
+                file.sync_all()?;
+                drop(file);
+                OpenOptions::new().read(true).open(path)?
             }
-            NodeBlockStorage::OnDisk(_) => {
+            NodeBlockStorage::OnDisk { .. } => {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
                     "node block is already swapped out",
@@ -459,7 +557,49 @@ impl NodeBlock {
             }
         };
         // Assignment drops the previous storage (and the in-memory mmap inside it).
-        self.storage = NodeBlockStorage::OnDisk(new_file);
+        self.storage = NodeBlockStorage::OnDisk {
+            file: new_file,
+            offset: 0,
+        };
+        Ok(())
+    }
+
+    /// Like [`NodeBlock::swap_out`] but writes into a caller-supplied, already-open chunk
+    /// file at a caller-computed byte `offset` instead of truncating a whole file for this
+    /// block alone. [`ArenaNodeStore::swap_out`] uses this to pack up to
+    /// [`BLOCKS_PER_FILE`] blocks into one shared file, cutting per-file open/close
+    /// overhead on restore. `chunk_path` is reopened read-only for this block's own
+    /// [`NodeBlockStorage::OnDisk`] handle so each block keeps an independent fd.
+    fn swap_out_at(&mut self, chunk_file: &File, chunk_path: &Path, offset: u64) -> io::Result<()> {
+        match &self.storage {
+            NodeBlockStorage::InMemory(arena) => {
+                let mapped = arena.mapped_bytes();
+                // SAFETY: `arena.as_ptr()` is valid for `mapped` bytes (the anonymous mmap).
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(arena.as_ptr(), mapped) };
+                let mut hasher = Crc32Hasher::new();
+                hasher.update(bytes);
+                let checksum = hasher.finalize();
+                write_at(chunk_file, bytes, offset)?;
+                write_at(chunk_file, &checksum.to_le_bytes(), offset + mapped as u64)?;
+            }
+            NodeBlockStorage::OnDisk { .. } => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "node block is already swapped out",
+                ));
+            }
+            NodeBlockStorage::Evicted => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "cannot swap_out an evicted node block; restore via swap_in_from first",
+                ));
+            }
+        }
+        let read_file = OpenOptions::new().read(true).open(chunk_path)?;
+        self.storage = NodeBlockStorage::OnDisk {
+            file: read_file,
+            offset,
+        };
         Ok(())
     }
 
@@ -483,6 +623,16 @@ impl NodeBlock {
     /// somewhere other than the original swap-out target (e.g. a fresh download from
     /// blob storage). The block's `len` (node count) and `block_index` are preserved.
     pub fn swap_in_from(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
+        let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
+        self.swap_in_from_with(path, arena)
+    }
+
+    /// Like [`NodeBlock::swap_in_from`] but restores into a caller-supplied arena instead
+    /// of allocating a fresh `mmap` for this block alone. [`ArenaNodeStore::load_from_dir`]
+    /// uses this to restore every block of a directory into one shared mmap
+    /// (`Arena::try_with_capacity_batch`) rather than paying a separate `mmap()` and
+    /// first-touch page-fault cost per block.
+    fn swap_in_from_with(&mut self, path: impl AsRef<Path>, arena: Arena) -> io::Result<()> {
         let mut file = OpenOptions::new().read(true).open(path.as_ref())?;
         let file_len = file.metadata()?.len() as usize;
         if file_len < 4 {
@@ -492,7 +642,6 @@ impl NodeBlock {
             ));
         }
         let arena_len = file_len - 4;
-        let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
         // SAFETY: anonymous mmap is at least `mapped_bytes() >= arena_len` bytes; we treat
         // the first `arena_len` bytes as the destination buffer for the file contents.
         let dest: &mut [u8] = unsafe {
@@ -520,42 +669,70 @@ impl NodeBlock {
         Ok(())
     }
 
+    /// Like [`NodeBlock::swap_in_from_with`] but reads a fixed-size slot at `offset` within
+    /// an already-open chunk file instead of treating a whole file as one block.
+    /// [`ArenaNodeStore::load_from_dir`] and [`ArenaNodeStore::swap_in_from`] open each
+    /// chunk file once and restore every block packed into it through this method — the
+    /// whole point of consolidating [`BLOCKS_PER_FILE`] blocks into one file is to pay one
+    /// `open()` per chunk instead of one per block. The slot size is always
+    /// `arena.mapped_bytes()` (every block uses `DEFAULT_ARENA_CAPACITY`), so — unlike
+    /// [`NodeBlock::swap_in_from_with`] — it is not inferred from the file's total length.
+    fn swap_in_at_file(&mut self, file: &File, offset: u64, arena: Arena) -> io::Result<()> {
+        let arena_len = arena.mapped_bytes();
+        // SAFETY: anonymous mmap is at least `mapped_bytes()` bytes; we treat the whole
+        // mapping as the destination buffer for this block's slot bytes.
+        let dest: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena_len) };
+        read_at(&file, dest, offset)?;
+        let mut crc_buf = [0u8; 4];
+        read_at(&file, &mut crc_buf, offset + arena_len as u64)?;
+        let stored_crc = u32::from_le_bytes(crc_buf);
+        let mut hasher = Crc32Hasher::new();
+        hasher.update(dest);
+        let computed_crc = hasher.finalize();
+        if computed_crc != stored_crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "arena CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"
+                ),
+            ));
+        }
+        // Seal the arena so future push_node calls return None.
+        let cap = arena.capacity_bytes();
+        let _ = arena.try_alloc_slice_aligned::<u8>(cap, 1);
+        self.storage = NodeBlockStorage::InMemory(arena);
+        Ok(())
+    }
+
     /// Restore an [`NodeBlockStorage::OnDisk`] block to memory by reading the file into a
     /// fresh anonymous arena. Errors if the block is already in memory.
     ///
     /// The restored arena is sealed: bump = capacity, so further [`NodeBlock::push_node`]
     /// calls return `None`. Reads (`neighbors_at`, etc.) work normally.
     pub fn swap_in(&mut self) -> io::Result<()> {
+        let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
+        self.swap_in_with(arena)
+    }
+
+    /// Like [`NodeBlock::swap_in`] but restores into a caller-supplied arena instead of
+    /// allocating a fresh `mmap` for this block alone. [`ArenaNodeStore::swap_in`] uses
+    /// this to restore every on-disk block of a bucket into one shared mmap
+    /// (`Arena::try_with_capacity_batch`) rather than paying a separate `mmap()` and
+    /// first-touch page-fault cost per block.
+    fn swap_in_with(&mut self, arena: Arena) -> io::Result<()> {
         let new_arena = match &mut self.storage {
-            NodeBlockStorage::OnDisk(file) => {
-                let file_len = file.metadata()?.len() as usize;
-                if file_len < 4 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "arena file too small",
-                    ));
-                }
-                let arena_len = file_len - 4;
-                let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
-                // SAFETY: anonymous mmap is at least `mapped_bytes() >= arena_len` bytes; we treat
-                // the first `arena_len` bytes as the destination buffer for the file contents.
-                let dest: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena.mapped_bytes())
-                };
-                file.seek(SeekFrom::Start(0))?;
-                file.read_exact(&mut dest[..arena_len])?;
-                let mut crc_buf = [0u8; 4];
-                file.read_exact(&mut crc_buf)?;
-                let stored_crc = u32::from_le_bytes(crc_buf);
-                let mut hasher = Crc32Hasher::new();
-                hasher.update(&dest[..arena_len]);
-                let computed_crc = hasher.finalize();
-                if computed_crc != stored_crc {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("arena CRC32 mismatch: expected {stored_crc:#010x}, got {computed_crc:#010x}"),
-                    ));
-                }
+            NodeBlockStorage::OnDisk { file, offset } => {
+                let arena_len = arena.mapped_bytes();
+                // SAFETY: anonymous mmap is at least `mapped_bytes()` bytes; we treat the
+                // whole mapping as the destination buffer for the block's slot bytes.
+                let dest: &mut [u8] =
+                    unsafe { std::slice::from_raw_parts_mut(arena.as_ptr() as *mut u8, arena_len) };
+                read_at(file, dest, *offset)?;
+                // The trailing 4-byte CRC32 written by swap_out is intentionally not read or
+                // verified here: the check costs a full pass over the block's bytes, which
+                // dominates swap_in's wall-clock time. Corruption of on-disk blocks is assumed
+                // to be handled at a layer below this one (e.g. storage-level checksums).
                 // Seal: advance bump to the full capacity so future push_node calls return None.
                 let cap = arena.capacity_bytes();
                 let _ = arena.try_alloc_slice_aligned::<u8>(cap, 1);
@@ -680,17 +857,19 @@ impl ArenaNodeStore {
         }
     }
 
-    /// Populate this store from `block_*.arena` files in `dir`, creating one
-    /// [`NodeBlock`] per file. Clears any existing blocks first. Used during crash
-    /// recovery to reconstruct arena state from files uploaded to S3 by the snapshot
-    /// task. Returns the number of blocks loaded.
+    /// Populate this store from `chunk_*.arena` files in `dir` (each holding up to
+    /// [`BLOCKS_PER_FILE`] blocks back-to-back), creating one [`NodeBlock`] per slot.
+    /// Clears any existing blocks first. Used during crash recovery to reconstruct arena
+    /// state from files uploaded to S3 by the snapshot task. Returns the number of blocks
+    /// loaded.
     ///
     /// `len` on each restored block is 0 (node count is not serialized into the arena
     /// file); search correctness is unaffected because `vector_at`/`neighbors_at` use
     /// raw byte offsets, not the counter.
     pub fn load_from_dir(&mut self, dir: impl AsRef<Path>) -> io::Result<usize> {
         let dir = dir.as_ref();
-        let mut entries: Vec<(usize, PathBuf)> = Vec::new();
+        let stride = chunk_block_stride();
+        let mut chunks: Vec<(usize, PathBuf)> = Vec::new();
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -698,76 +877,156 @@ impl ArenaNodeStore {
                 continue;
             }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if let Some(idx_str) = stem.strip_prefix("block_") {
-                    if let Ok(idx) = idx_str.parse::<usize>() {
-                        entries.push((idx, path));
+                if let Some(idx_str) = stem.strip_prefix("chunk_") {
+                    if let Ok(chunk_idx) = idx_str.parse::<usize>() {
+                        chunks.push((chunk_idx, path));
                     }
                 }
             }
         }
-        entries.sort_by_key(|(idx, _)| *idx);
+        chunks.sort_by_key(|(idx, _)| *idx);
+
+        // Every chunk file holds a contiguous run of blocks back-to-back at a fixed
+        // stride, so the block count per chunk is just its file size / stride — no
+        // manifest needed.
+        let mut chunk_counts: Vec<usize> = Vec::with_capacity(chunks.len());
+        let mut total_blocks = 0usize;
+        for (_, path) in &chunks {
+            let file_len = std::fs::metadata(path)?.len();
+            let blocks_in_chunk = (file_len / stride) as usize;
+            chunk_counts.push(blocks_in_chunk);
+            total_blocks += blocks_in_chunk;
+        }
+
+        // One batched mmap for every block instead of `total_blocks` separate mmap()
+        // calls — see `ArenaNodeStore::swap_in`, which uses the same batching for the
+        // same reason on the warm-restore path.
+        let mut arenas = Arena::try_with_capacity_batch(total_blocks, DEFAULT_ARENA_CAPACITY)?
+            .into_iter();
 
         self.blocks.clear();
-        for (block_index, path) in entries {
-            // try_new allocates a fresh arena; swap_in_from immediately replaces it with
-            // the on-disk bytes, so the initial mmap is dropped right away.
-            let mut block = NodeBlock::try_new(self.dim, self.m, self.m_max0, block_index)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "NodeBlock alloc failed"))?;
-            block.swap_in_from(&path)?;
-            self.blocks.push(block);
+        for ((chunk_idx, path), blocks_in_chunk) in chunks.iter().zip(chunk_counts) {
+            // Open the chunk file once and restore every block packed into it through the
+            // same handle — the whole point of consolidation is one open() per chunk
+            // instead of one per block.
+            let file = OpenOptions::new().read(true).open(path)?;
+            for slot in 0..blocks_in_chunk {
+                let block_index = chunk_idx * BLOCKS_PER_FILE + slot;
+                let offset = slot as u64 * stride;
+                let arena = arenas.next().expect("arena count matches total_blocks");
+                let mut block = NodeBlock {
+                    storage: NodeBlockStorage::Evicted,
+                    len: 0,
+                    block_index,
+                    dim: self.dim,
+                    m: self.m,
+                    m_max0: self.m_max0,
+                };
+                block.swap_in_at_file(&file, offset, arena)?;
+                self.blocks.push(block);
+            }
         }
         Ok(self.blocks.len())
     }
 
-    /// Copy every in-memory block to `dir` as `block_<idx>.arena` without changing
+    /// Copy every in-memory block to `dir`, packed into `chunk_<n>.arena` files exactly
+    /// like [`swap_out`] (up to [`BLOCKS_PER_FILE`] blocks per file), without changing
     /// storage state. On-disk and evicted blocks are skipped. Returns the number of
     /// blocks written. The output format matches [`swap_out`] so files can be uploaded
     /// to S3 and later restored via [`swap_in_from`].
     pub fn snapshot_to_dir(&self, dir: impl AsRef<Path>) -> io::Result<usize> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        let mut written = 0;
-        for block in &self.blocks {
-            if !block.is_in_memory() {
-                continue;
+        let stride = chunk_block_stride();
+
+        let mut by_chunk: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if block.is_in_memory() {
+                by_chunk
+                    .entry(block.block_index / BLOCKS_PER_FILE)
+                    .or_default()
+                    .push(i);
             }
-            let path = dir.join(format!("block_{}.arena", block.block_index));
-            block.copy_to(&path)?;
-            written += 1;
+        }
+
+        let mut written = 0;
+        for (chunk_idx, positions) in by_chunk {
+            let path = dir.join(format!("chunk_{chunk_idx}.arena"));
+            let chunk_file = OpenOptions::new().write(true).create(true).open(&path)?;
+            for i in positions {
+                let block_index = self.blocks[i].block_index;
+                let offset = chunk_block_offset(block_index, stride);
+                self.blocks[i].copy_to_at(&chunk_file, offset)?;
+                written += 1;
+            }
+            chunk_file.sync_all()?;
         }
         Ok(written)
     }
 
-    /// Swap every in-memory block in this store to `dir`, one file per block named
-    /// `block_<block_index>.arena`. The directory is created if missing.
+    /// Swap every in-memory block in this store to `dir`, packing up to
+    /// [`BLOCKS_PER_FILE`] blocks into each `chunk_<n>.arena` file (`n = block_index /
+    /// BLOCKS_PER_FILE`) instead of one file per block. The directory is created if
+    /// missing.
     ///
     /// Already-on-disk blocks are skipped (not an error). Returns the number of blocks
     /// that transitioned from memory to disk in this call.
     pub fn swap_out(&mut self, dir: impl AsRef<Path>) -> io::Result<usize> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir)?;
-        let mut moved = 0;
-        for block in &mut self.blocks {
-            if block.is_on_disk() {
-                continue;
+        let stride = chunk_block_stride();
+
+        // Group pending blocks by chunk file so each chunk is opened once, not once per
+        // block — this is the whole point of consolidation.
+        let mut by_chunk: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if !block.is_on_disk() {
+                by_chunk
+                    .entry(block.block_index / BLOCKS_PER_FILE)
+                    .or_default()
+                    .push(i);
             }
-            let path = dir.join(format!("block_{}.arena", block.block_index));
-            block.swap_out(&path)?;
-            moved += 1;
+        }
+
+        let mut moved = 0;
+        for (chunk_idx, positions) in by_chunk {
+            let path = dir.join(format!("chunk_{chunk_idx}.arena"));
+            let chunk_file = OpenOptions::new().write(true).create(true).open(&path)?;
+            for i in positions {
+                let block_index = self.blocks[i].block_index;
+                let offset = chunk_block_offset(block_index, stride);
+                self.blocks[i].swap_out_at(&chunk_file, &path, offset)?;
+                moved += 1;
+            }
+            chunk_file.sync_all()?;
         }
         Ok(moved)
     }
 
     /// Swap every on-disk block back into memory. Already-in-memory blocks are skipped.
     /// Returns the number of blocks restored.
+    ///
+    /// Restores into one shared mmap (`Arena::try_with_capacity_batch`) instead of
+    /// calling `mmap()` once per block: hundreds of small fresh mappings each pay their
+    /// own first-touch page-fault cost, which dominates wall-clock restore time far more
+    /// than the actual disk read does.
     pub fn swap_in(&mut self) -> io::Result<usize> {
-        let mut restored = 0;
-        for block in &mut self.blocks {
-            if block.is_in_memory() {
-                continue;
-            }
-            block.swap_in()?;
-            restored += 1;
+        let pending: Vec<usize> = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.is_in_memory())
+            .map(|(i, _)| i)
+            .collect();
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let restored = pending.len();
+        let arenas = Arena::try_with_capacity_batch(pending.len(), DEFAULT_ARENA_CAPACITY)?;
+        for (block_index, arena) in pending.into_iter().zip(arenas) {
+            self.blocks[block_index].swap_in_with(arena)?;
         }
         Ok(restored)
     }
@@ -789,19 +1048,38 @@ impl ArenaNodeStore {
         evicted
     }
 
-    /// Restore every non-in-memory block by reading `dir/block_<block_index>.arena`.
-    /// Files must exist for every evicted/on-disk block; missing files surface as I/O errors.
-    /// Already-in-memory blocks are skipped. Returns the number of blocks restored.
+    /// Restore every non-in-memory block by reading its slot from
+    /// `dir/chunk_<block_index / BLOCKS_PER_FILE>.arena`. Files must exist for every
+    /// evicted/on-disk block; missing files surface as I/O errors. Already-in-memory
+    /// blocks are skipped. Returns the number of blocks restored.
     pub fn swap_in_from(&mut self, dir: impl AsRef<Path>) -> io::Result<usize> {
         let dir = dir.as_ref();
-        let mut restored = 0;
-        for block in &mut self.blocks {
-            if block.is_in_memory() {
-                continue;
+        let stride = chunk_block_stride();
+
+        // Group pending blocks by chunk file so each chunk is opened once, not once per
+        // block — the same reasoning as `swap_out`/`snapshot_to_dir`/`load_from_dir`.
+        let mut by_chunk: std::collections::BTreeMap<usize, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, block) in self.blocks.iter().enumerate() {
+            if !block.is_in_memory() {
+                by_chunk
+                    .entry(block.block_index / BLOCKS_PER_FILE)
+                    .or_default()
+                    .push(i);
             }
-            let path = dir.join(format!("block_{}.arena", block.block_index));
-            block.swap_in_from(&path)?;
-            restored += 1;
+        }
+
+        let mut restored = 0;
+        for (chunk_idx, positions) in by_chunk {
+            let path = chunk_file_path(dir, chunk_idx * BLOCKS_PER_FILE);
+            let file = OpenOptions::new().read(true).open(&path)?;
+            for i in positions {
+                let block_index = self.blocks[i].block_index;
+                let offset = chunk_block_offset(block_index, stride);
+                let arena = Arena::try_with_capacity(DEFAULT_ARENA_CAPACITY)?;
+                self.blocks[i].swap_in_at_file(&file, offset, arena)?;
+                restored += 1;
+            }
         }
         Ok(restored)
     }

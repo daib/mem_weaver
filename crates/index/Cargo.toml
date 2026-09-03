@@ -19,4 +19,7 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 qdrant-client = "1.18.0"
+lancedb = "0.37.1"
+arrow-array = "58"
+arrow-schema = "58"
 tokio = { workspace = true }

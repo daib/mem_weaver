@@ -189,6 +189,27 @@ SIFT1M, k=10, 10,000 queries, ef_construction=100 + capacity-aware, restored fro
 
 The min=0.300 across all configurations reflects two hard queries in sparse regions of SIFT1M — a fundamental HNSW characteristic at M=16, ef_search=100, not an implementation issue.
 
+#### Cold-load benchmark: mem_weaver vs. LanceDB
+
+Full writeup: [`docs/cold-load-benchmark-findings.md`](docs/cold-load-benchmark-findings.md). SIFT1M, 1M vectors / 128 dim, page cache dropped between build and load (`sudo purge`) for genuine cold-disk numbers.
+
+mem_weaver's HNSW does an eager, whole-index bulk load; LanceDB is lazy/mmap-backed and pages in only what a query touches. That shape difference flips the winner depending on workload:
+
+| | mem_weaver (HNSW) | LanceDB (auto partitions) | LanceDB (1 partition) |
+|---|---|---|---|
+| Cold time-to-first-answer | ~248 ms (after file consolidation, down from ~389–427 ms) | ~212 ms | ~264 ms |
+| Cold time-to-first-answer, CRC32 skipped (projected) | ~144 ms | ~212 ms | ~264 ms |
+| Warm p50 latency | 0.25–0.34 ms | 1.4–5.2 ms | 1.4–5.2 ms |
+| Warm peak QPS | ~14,000–15,400 | ~1,220–1,320 | ~1,220–1,320 |
+
+mem_weaver's cold load is still slower than LanceDB even after consolidation — LanceDB's lazy/mmap attach only pages in the O(log N) graph nodes one query's traversal touches, while mem_weaver pays for reconstructing the whole index up front regardless of query count.
+
+CRC32 verification accounts for ~104ms of the measured 247.7ms reconstruction (§5, §6 of the writeup). Skipping it is only safe on trusted local-disk restores, not the blob/S3-restore path where corruption risk is real, and it hasn't been implemented (`verify_crc: bool` param is still an open item) — so the ~144ms row above is a projection from the measured CRC32 cost, not a benchmarked number.
+
+**Bottom line:** one-shot/bursty workloads favor LanceDB's cheap lazy attach; long-lived, high-QPS workloads favor mem_weaver's amortized eager load by ~10–50x on latency/throughput.
+
+Biggest lever found for mem_weaver's cold-load cost: consolidating per-block files into fixed-size chunk files cut raw cold I/O by 37% (308 `open()` calls → 10) and total reconstruction from ~389–427ms to ~248ms. This is a genuine trade-off, not a free win — it costs up to ~19% throughput on the *other* on-disk path (direct `pread` queries against blocks that are never bulk-restored), since 308 blocks now share only 10 file descriptors. See the full doc for the CRC32 cost breakdown and remaining open items (skipping CRC32 on trusted local restores is not yet implemented).
+
 ---
 
 ## Temporal Architecture

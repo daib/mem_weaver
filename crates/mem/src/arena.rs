@@ -11,12 +11,24 @@ use std::cell::{Cell, UnsafeCell};
 use std::io;
 use std::mem::size_of;
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
+
+/// Backing memory for an [`Arena`]: either an mmap the arena owns outright, or a byte
+/// range within an mmap shared by several arenas (see [`Arena::try_with_capacity_batch`]).
+enum Backing {
+    Owned(MmapMut),
+    Shared {
+        map: Arc<MmapMut>,
+        offset: usize,
+        len: usize,
+    },
+}
 
 pub struct Arena {
     max_bytes: usize,
     bump: Cell<usize>,
     /// `None` when `capacity_bytes == 0`.
-    storage: UnsafeCell<Option<MmapMut>>,
+    storage: UnsafeCell<Option<Backing>>,
 }
 
 impl Arena {
@@ -53,8 +65,61 @@ impl Arena {
         Ok(Self {
             max_bytes: capacity,
             bump: Cell::new(0),
-            storage: UnsafeCell::new(Some(map)),
+            storage: UnsafeCell::new(Some(Backing::Owned(map))),
         })
+    }
+
+    /// Allocate `n` arenas of `capacity` bytes each, backed by **one** shared anonymous
+    /// mmap instead of `n` separate `mmap()` calls. Intended for restoring many blocks
+    /// from disk in a single pass (see `ArenaNodeStore::swap_in`): issuing hundreds of
+    /// small `mmap()`s each pays its own first-touch page-fault cost, which dominates
+    /// wall-clock restore time far more than the actual disk read does.
+    pub fn try_with_capacity_batch(n: usize, capacity: usize) -> io::Result<Vec<Arena>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        if capacity == 0 {
+            return Ok((0..n)
+                .map(|_| Arena {
+                    max_bytes: 0,
+                    bump: Cell::new(0),
+                    storage: UnsafeCell::new(None),
+                })
+                .collect());
+        }
+
+        let mapped_len = capacity.next_multiple_of(system_page_size());
+        let total = mapped_len.checked_mul(n).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "arena batch size overflow")
+        })?;
+
+        #[cfg(target_os = "linux")]
+        let mut map = MmapMut::map_anon(total)?;
+        #[cfg(not(target_os = "linux"))]
+        let map = MmapMut::map_anon(total)?;
+
+        #[cfg(target_os = "linux")]
+        unsafe {
+            extern "C" {
+                fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: i32) -> i32;
+            }
+            const MADV_HUGEPAGE: i32 = 14;
+            let p = map.as_mut_ptr();
+            let _ = madvise(p.cast(), map.len(), MADV_HUGEPAGE);
+        }
+
+        let shared = Arc::new(map);
+        Ok((0..n)
+            .map(|i| Arena {
+                max_bytes: capacity,
+                bump: Cell::new(0),
+                storage: UnsafeCell::new(Some(Backing::Shared {
+                    map: Arc::clone(&shared),
+                    offset: i * mapped_len,
+                    len: mapped_len,
+                })),
+            })
+            .collect())
     }
 
     #[must_use]
@@ -71,10 +136,24 @@ impl Arena {
         self.max_bytes.saturating_sub(self.bump.get())
     }
 
+    /// Bytes an anonymous mapping of `capacity` bytes actually occupies once rounded up
+    /// to the system page size — i.e. what [`Arena::mapped_bytes`] would return for an
+    /// arena created with `try_with_capacity(capacity)`, without allocating one.
+    #[must_use]
+    pub fn mapped_bytes_for(capacity: usize) -> usize {
+        capacity.next_multiple_of(system_page_size())
+    }
+
     /// Bytes reserved from the kernel for this arena (multiple of page size, or 0).
     #[must_use]
     pub fn mapped_bytes(&self) -> usize {
-        unsafe { (*self.storage.get()).as_ref().map_or(0, |m| m.len()) }
+        unsafe {
+            match (*self.storage.get()).as_ref() {
+                Some(Backing::Owned(m)) => m.len(),
+                Some(Backing::Shared { len, .. }) => *len,
+                None => 0,
+            }
+        }
     }
 
     /// Alias for [`Arena::mapped_bytes`] (legacy name from the bumpalo era).
@@ -87,9 +166,15 @@ impl Arena {
     #[must_use]
     pub fn as_ptr(&self) -> *const u8 {
         unsafe {
-            (*self.storage.get())
-                .as_ref()
-                .map_or(ptr::null(), |m| m.as_ptr())
+            match (*self.storage.get()).as_ref() {
+                Some(Backing::Owned(m)) => m.as_ptr(),
+                // SAFETY: `offset + len <= map.len()` is upheld by construction in
+                // `try_with_capacity_batch`, and each Shared arena's byte range is
+                // disjoint from every other arena sharing `map`, so no other Arena
+                // reads/writes these bytes concurrently.
+                Some(Backing::Shared { map, offset, .. }) => map.as_ptr().add(*offset),
+                None => ptr::null(),
+            }
         }
     }
 
@@ -200,9 +285,7 @@ impl Arena {
         }
 
         unsafe {
-            let storage = &mut *self.storage.get();
-            let map = storage.as_mut()?;
-            let base = map.as_mut_ptr();
+            let base = self.base_mut_ptr()?;
             if start > current {
                 let pad = start - current;
                 ptr::write_bytes(base.add(current), 0, pad);
@@ -210,6 +293,28 @@ impl Arena {
             let ptr = base.add(start);
             self.bump.set(new_bump);
             Some(NonNull::new_unchecked(ptr))
+        }
+    }
+
+    /// Mutable base pointer into the backing store, regardless of whether it's owned
+    /// outright or a shared view.
+    ///
+    /// # Safety
+    /// Caller must not alias the returned pointer's `[0, mapped_bytes())` range with any
+    /// other live reference. Holds for `Owned` because `Arena` has exclusive ownership;
+    /// holds for `Shared` because `try_with_capacity_batch` hands out disjoint byte
+    /// ranges of the underlying mmap, one per arena.
+    unsafe fn base_mut_ptr(&self) -> Option<*mut u8> {
+        match &*self.storage.get() {
+            Some(Backing::Owned(m)) => {
+                // SAFETY: `Arena` exclusively owns this `MmapMut`; `as_ptr` here is cast
+                // to `*mut u8` rather than reborrowed via `&mut` because `alloc_raw` only
+                // has `&self`, matching the existing bump-allocator pattern where mutation
+                // is expressed through raw pointers derived from `UnsafeCell`.
+                Some(m.as_ptr() as *mut u8)
+            }
+            Some(Backing::Shared { map, offset, .. }) => Some((map.as_ptr() as *mut u8).add(*offset)),
+            None => None,
         }
     }
 }

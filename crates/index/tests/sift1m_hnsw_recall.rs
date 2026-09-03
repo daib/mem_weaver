@@ -323,17 +323,51 @@ fn sift1m_hnsw_qps_disk() {
     let t_swap = Instant::now();
     let moved = index.swap_out(&dir).expect("swap_out to disk");
     eprintln!(
-        "sift1m_hnsw_qps_disk: swapped {moved} blocks to disk at {dir:?} in {:.3} ms",
-        ms(t_swap.elapsed())
+        "sift1m_hnsw_qps_disk: swapped {moved} blocks to disk at {dir:?} in {:.3} ms \
+         ({:.3} ms/1k vectors)",
+        ms(t_swap.elapsed()),
+        ms(t_swap.elapsed()) / (n_base as f64 / 1000.0),
     );
 
     let queries: Vec<Vec<f32>> = (0..n_q)
         .map(|qi| read_fvecs_vector_at(ctx.q_data(), dim, qi % ctx.n_q).expect("query fvecs"))
         .collect();
 
+    // First query after swap_out has to fault in every block it touches straight from
+    // the OnDisk (pread) path with nothing warmed — no separate index-level cache to
+    // populate, unlike LanceDB's Session/GlobalIndexCache, so this should only reflect
+    // per-block pread cost, not a cold-cache penalty.
+    let t_first = Instant::now();
+    let _ = index.search(&queries[0], K, ef);
+    eprintln!(
+        "sift1m_hnsw_qps_disk: COLD first query latency = {:.3} ms",
+        ms(t_first.elapsed())
+    );
+    let n_warmup = 20.min(n_q.saturating_sub(1));
+    eprint!("sift1m_hnsw_qps_disk: warm-up curve (ms):");
+    for q in &queries[1..=n_warmup] {
+        let t0 = Instant::now();
+        let _ = index.search(q, K, ef);
+        eprint!(" {:.3}", ms(t0.elapsed()));
+    }
+    eprintln!();
+
     helpers::sift::measure_qps("sift1m_hnsw_qps_disk", &queries, &[1, 2, 4, 6], |query| {
         index.search(query, K, ef)
     });
+
+    // Full disk-to-memory reload: reads every swapped-out block back into a fresh
+    // anonymous-mmap Arena (read_exact + CRC32 check per block), the same path used
+    // by TimeBucketIndex::add_restored_bucket / swap_bucket_in on service startup —
+    // as opposed to the lazy per-node pread the OnDisk path above just measured.
+    let t_load = Instant::now();
+    let restored = index.swap_in().expect("swap_in from disk");
+    eprintln!(
+        "sift1m_hnsw_qps_disk: swap_in restored {restored} blocks ({n_base} vectors) to RAM in \
+         {:.3} ms ({:.3} ms/1k vectors)",
+        ms(t_load.elapsed()),
+        ms(t_load.elapsed()) / (n_base as f64 / 1000.0),
+    );
 }
 
 #[test]
